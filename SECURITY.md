@@ -2,10 +2,10 @@
 
 ## Supported versions
 
-Security fixes are provided for the latest published release. This repository
-currently stages a single independent preview snapshot (`0.1.0-preview1`) whose
-prebuilt image has not been published to GitHub Container Registry yet, so there
-is no installable release to patch until that image exists.
+Security fixes are provided for the latest published release. The current
+release is the independent `0.1.0-preview1` preview snapshot; its prebuilt
+multi-architecture image is published to GitHub Container Registry at
+`ghcr.io/shymonke/okam-ha-native`.
 
 ## Supported scope
 

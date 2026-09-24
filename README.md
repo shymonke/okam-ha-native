@@ -5,16 +5,15 @@ to Home Assistant on 64-bit ARM (`aarch64`) and x86-64 (`amd64`) systems. Live
 video, snapshots, camera wake-up, and disconnects are handled by the Home
 Assistant host.
 
-> **Snapshot status: preview, not yet installable from a registry.**
+> **Status: preview image available and installable.**
 >
-> This is the first independent `shymonke/okam-ha-native` snapshot
+> This is the independent `shymonke/okam-ha-native` preview
 > (`0.1.0-preview1`). It captures the validated single-camera O-KAM Pro / CS2
-> bridge. The prebuilt multi-architecture image has **not** been published to
-> GitHub Container Registry yet, so the Home Assistant app **cannot be
-> installed from the app store** until `ghcr.io/shymonke/okam-ha-native` exists.
-> The image workflow is manual-only for exactly this reason; run it explicitly
-> to produce the first image. Treat this notice as current until that image is
-> available.
+> bridge. The multi-architecture preview image is published to GitHub Container
+> Registry at `ghcr.io/shymonke/okam-ha-native` with `linux/arm64` and
+> `linux/amd64` manifests, so the Home Assistant app can be installed from the
+> app store. This is still a preview: VP-series cameras may enumerate but cannot
+> stream, and PTZ / IR control is unsupported.
 
 ## Scope and limitations
 
@@ -63,11 +62,10 @@ The project contains both required parts:
 - An O-KAM Pro (CS2) camera that works in the O-KAM mobile app
 - An O-KAM account that can view exactly one camera; the account may own the
   camera or have it shared to it
-- A published `ghcr.io/shymonke/okam-ha-native` image before the app can be
-  installed (see the snapshot status above), plus HACS or access to
-  `/config/custom_components` for the integration
+- The published `ghcr.io/shymonke/okam-ha-native` multi-architecture image,
+  plus HACS or access to `/config/custom_components` for the integration
 
-When an image is available it is published as one multi-architecture build:
+The image is published as one multi-architecture build:
 
 | Home Assistant architecture | Typical systems |
 | --- | --- |
@@ -95,8 +93,8 @@ configuration.
 
 ### 2. Install the O-KAM Native Bridge app
 
-The prebuilt image has not been published yet, so this step is not possible
-until `ghcr.io/shymonke/okam-ha-native` exists. When it does:
+The prebuilt multi-architecture image is available at
+`ghcr.io/shymonke/okam-ha-native`. Install it with:
 
 1. In Home Assistant, open **Settings → Apps → App store**.
 2. Open the app-store menu and select **Repositories**.
@@ -231,10 +229,9 @@ problems.
 ## Building the image
 
 The image workflow in `.github/workflows/publish-image.yml` is manual-only.
-Dispatch it with no input to publish the version in `okam_native_app/config.yaml`,
-or set `tag_suffix` for a throwaway test tag. `latest` only ever moves from the
-`main` branch. The workflow is the supported way to create the GHCR image that
-the snapshot status above refers to.
+Dispatch it with no input to republish the version in
+`okam_native_app/config.yaml`, or set `tag_suffix` for a throwaway test tag.
+`latest` only ever moves from the `main` branch.
 
 ## Uninstalling
 

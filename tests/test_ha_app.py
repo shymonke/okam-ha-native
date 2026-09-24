@@ -248,9 +248,9 @@ def test_documentation_is_honest_about_scope_and_install_status() -> None:
     assert "vp-series" in lowered
     assert "ptz" in lowered
     assert "night-vision" in lowered
-    # This snapshot is a preview whose prebuilt image is not published yet.
+    # The preview image is published and installable.
     assert "preview" in lowered
-    assert "not been published" in lowered
+    assert "published" in lowered
     assert "ghcr.io/shymonke/okam-ha-native" in combined
 
 

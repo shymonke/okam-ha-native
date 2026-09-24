@@ -25,12 +25,12 @@ shipped components that share a release version:
 - VP-series cameras may be enumerated by the account service but cannot be
   streamed. They are not supported.
 - PTZ (pan/tilt/zoom) and IR / night-vision control are not implemented.
-- The prebuilt `ghcr.io/shymonke/okam-ha-native` image has not been published
-  yet. Until it exists, the app is not installable from the app store, and the
-  image workflow must stay manual-only. Do not describe this snapshot as
-  installable until that image is published. Keep the installation-status notice
-  in `README.md`, `okam_native_app/README.md`, and `okam_native_app/DOCS.md`
-  current.
+- The validated `ghcr.io/shymonke/okam-ha-native` preview image is published
+  with `linux/arm64` and `linux/amd64` manifests, so the app is installable from
+  the app store. The image workflow is `workflow_dispatch`-only; keep publication
+  manual and republish through it rather than re-enabling a `push` trigger. Keep
+  the install-availability and supported-scope statements in `README.md`,
+  `okam_native_app/README.md`, and `okam_native_app/DOCS.md` current.
 
 ## Working rule for protocol changes
 
@@ -93,7 +93,7 @@ Optional extras (`pyproject.toml`): `trace` (frida), `inspect`/`test`
 
 The app version is aligned across `pyproject.toml`, `okam_native_app/config.yaml`,
 `custom_components/okam/manifest.json`, and the Dockerfile `BUILD_VERSION`
-default. The publish workflow is `workflow_dispatch`-only; do not re-enable a
-`push` trigger until the first push is intentionally released. A published image
-must carry both `linux/amd64` and `linux/arm64` manifests, the aarch64 Raspberry
+default. The publish workflow is `workflow_dispatch`-only; keep it manual and do
+not re-enable a `push` trigger. A published image must carry both
+`linux/amd64` and `linux/arm64` manifests, the aarch64 Raspberry
 Pi 4 regression must still pass, and the full unit suite plus CI must be green.

@@ -5,11 +5,10 @@ Assistant on `aarch64` and `amd64` systems. It provides live H.264 video, JPEG
 snapshots, automatic camera wake-up, shared viewing, and automatic idle
 disconnect.
 
-**Preview snapshot.** This is `0.1.0-preview1`. The prebuilt
-`ghcr.io/shymonke/okam-ha-native` image has not been published yet, so the app
-cannot be installed from the app store until that image exists. Until then,
-treat the installation steps below as the intended setup once an image is
-available.
+**Preview image available.** This is `0.1.0-preview1`. The validated
+single-camera O-KAM Pro / CS2 preview image is published at
+`ghcr.io/shymonke/okam-ha-native` for `aarch64` and `amd64`, so the app can be
+installed from the app store.
 
 ## Supported scope
 
