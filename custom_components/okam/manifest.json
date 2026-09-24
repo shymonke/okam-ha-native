@@ -1,0 +1,12 @@
+{
+  "domain": "okam",
+  "name": "O-KAM Native Bridge",
+  "version": "0.1.0-preview1",
+  "config_flow": true,
+  "iot_class": "local_polling",
+  "integration_type": "hub",
+  "requirements": [],
+  "documentation": "https://github.com/shymonke/okam-ha-native#readme",
+  "issue_tracker": "https://github.com/shymonke/okam-ha-native/issues",
+  "codeowners": ["@shymonke"]
+}

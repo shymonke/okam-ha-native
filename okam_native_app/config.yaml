@@ -1,0 +1,37 @@
+name: O-KAM Native Bridge
+version: 0.1.0-preview1
+slug: okam_ha_native
+description: Preview single-camera native O-KAM Pro/CS2 bridge for Home Assistant
+url: https://github.com/shymonke/okam-ha-native
+image: ghcr.io/shymonke/okam-ha-native
+arch:
+  - aarch64
+  - amd64
+startup: application
+boot: auto
+watchdog: http://[HOST]:[PORT:8099]/health
+ports:
+  8099/tcp: 8099
+ports_description:
+  8099/tcp: Native runtime status API
+options:
+  account_username: null
+  account_password: null
+  api_token: null
+  camera_id: cabin
+  idle_timeout_seconds: 120
+  run_connect_test: false
+  run_auth_test: false
+  run_stream_test: false
+  run_snapshot_test: false
+schema:
+  account_username: email
+  account_password: password
+  camera_password: password?
+  api_token: password
+  camera_id: "match(^[A-Za-z0-9_-]{1,32}$)"
+  idle_timeout_seconds: "int(10,600)"
+  run_connect_test: bool
+  run_auth_test: bool
+  run_stream_test: bool
+  run_snapshot_test: bool
