@@ -252,6 +252,18 @@ Assistant.
    The returned stream URL already carries a private stream key, so it opens
    directly in VLC, ffmpeg or OpenCV without the header.
 
+**Watching in a browser:** open
+
+```text
+http://HOST:8099/view?token=<guest token>
+```
+
+It shows every lens of every camera live (MJPEG, about 5 frames per second)
+with a snapshot link under each. Links can also carry the token instead of the
+header, for example `.../snapshot.jpg?lens=1&token=<guest token>`. A token in a
+link is visible in browser history and to anyone the link is sent to, so treat
+such links like the token itself.
+
 To revoke access, delete the entry and restart the app.
 
 ## Updating
@@ -316,8 +328,9 @@ The app enumerates the camera through the fixed official account service,
 wakes it through the official low-power service, and opens a native P2P
 transport. On `aarch64`, a minimal Bionic compatibility layer hosts the official
 ARM64 transport library. On `amd64`, a small pure-Python client implements the
-same encrypted camera protocol directly. H.264 is forwarded to Home Assistant
-without transcoding. FFmpeg is invoked only when a JPEG snapshot is requested.
+same encrypted camera protocol directly. FFmpeg repackages live H.264 into
+MPEG-TS for Home Assistant without re-encoding, and re-encodes JPEG for snapshots
+and the browser MJPEG viewer.
 Required official artifacts are downloaded from their pinned source and
 verified before use.
 

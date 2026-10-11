@@ -6,9 +6,10 @@ from datetime import timedelta
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .api import OkamApi, OkamApiError
+from .api import OkamApi, OkamApiError, OkamAuthError
 from .const import CONF_CAMERA_ID, CONF_SNAPSHOT_INTERVAL, DEFAULT_SNAPSHOT_INTERVAL, DOMAIN
 
 
@@ -33,5 +34,7 @@ class OkamCoordinator(DataUpdateCoordinator[dict]):
     async def _async_update_data(self) -> dict:
         try:
             return await self.api.status(self.camera_id)
+        except OkamAuthError as exc:
+            raise ConfigEntryAuthFailed(str(exc)) from exc
         except OkamApiError as exc:
             raise UpdateFailed(str(exc)) from exc

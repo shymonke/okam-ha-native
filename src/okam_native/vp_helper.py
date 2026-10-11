@@ -47,6 +47,8 @@ def open_stream_process(config: dict, *, environment: dict[str, str] | None = No
 
 
 MAX_LENS = 3
+# Seconds without any video after media started before the worker gives up.
+MEDIA_STALL_SECONDS = 20
 LENS_RECORD_HEADER = struct.Struct('>BI')
 
 
@@ -137,6 +139,7 @@ def run(config: dict, output, *, session_factory=VPSession) -> tuple[int, dict]:
         start_authenticated_stream(state, auth, substream=config.get('substream', 0))
         summary.update(authenticated=True, stream_start_sent=True)
         first_frame_deadline = time.monotonic() + 30
+        last_media = time.monotonic()
         while _running:
             stage = 'read_media'
             try:
@@ -144,7 +147,12 @@ def run(config: dict, output, *, session_factory=VPSession) -> tuple[int, dict]:
             except VPTimeout:
                 if not summary['h264_received'] and time.monotonic() >= first_frame_deadline:
                     raise VPError('VP media startup timed out')
+                # A relay that stays connected but stops sending video must end
+                # the worker, so the session reconnects instead of hanging.
+                if summary['h264_received'] and time.monotonic() - last_media >= MEDIA_STALL_SECONDS:
+                    raise VPError('VP media stalled')
                 continue
+            last_media = time.monotonic()
             valid, nal_keyframe = inspect_h264(payload)
             stage = 'validate_media'
             if not valid:

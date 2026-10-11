@@ -6,9 +6,10 @@ from dataclasses import dataclass
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .api import OkamApi
+from .api import OkamApi, OkamApiError, OkamAuthError
 from .const import (
     CONF_API_TOKEN,
     CONF_BRIDGE_URL,
@@ -42,7 +43,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: OkamConfigEntry) -> bool
             entry.data.get(CONF_IDLE_TIMEOUT, DEFAULT_IDLE_TIMEOUT),
         )
     )
-    await api.configure(camera_id, idle_timeout)
+    try:
+        await api.configure(camera_id, idle_timeout)
+    except OkamAuthError as exc:
+        raise ConfigEntryAuthFailed(str(exc)) from exc
+    except OkamApiError as exc:
+        raise ConfigEntryNotReady(str(exc)) from exc
     coordinator = OkamCoordinator(hass, entry, api)
     await coordinator.async_config_entry_first_refresh()
     entry.runtime_data = OkamRuntime(api, coordinator)

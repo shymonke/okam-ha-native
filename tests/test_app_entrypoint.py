@@ -449,3 +449,33 @@ def test_guest_tokens_are_generated_saved_and_named_only(monkeypatch, capsys) ->
     output = capsys.readouterr().out
     assert "guest_tokens_active=friend,kept" in output
     assert tokens["friend"] not in output and "k" * 32 not in output
+
+
+def test_lone_camera_alias_survives_adding_a_second_camera(monkeypatch) -> None:
+    monkeypatch.setattr(entrypoint, "load_options", lambda: {"camera_id": "cabin"})
+    assert entrypoint.camera_aliases([_device("u1", "Front Door")]) == ["cabin"]
+    two = entrypoint.camera_aliases([_device("u1", "Front Door"), _device("u2", "Barn")])
+    assert two == ["cabin", "barn"]
+    assert entrypoint.camera_aliases([_device("u1", "Front Door")]) == ["cabin"]
+
+
+def test_tokens_must_be_printable_ascii() -> None:
+    assert entrypoint._valid_token("a" * 32)
+    assert not entrypoint._valid_token("a" * 31 + "é")
+    assert not entrypoint._valid_token("a" * 16 + " " + "b" * 16)
+
+
+def test_lone_camera_never_takes_another_cameras_alias(monkeypatch) -> None:
+    monkeypatch.setattr(entrypoint, "load_options", lambda: {"camera_id": "cabin"})
+    assert entrypoint.camera_aliases([_device("a", "Front"), _device("b", "Barn")]) == ["front", "barn"]
+    entrypoint.camera_aliases([_device("a", "Front")])  # A alone: keeps "front"
+    assert entrypoint.camera_aliases([_device("b", "Barn")]) == ["barn"]
+    assert entrypoint.camera_aliases([_device("a", "Front"), _device("b", "Barn")]) == ["front", "barn"]
+
+
+def test_camera_password_override_skips_the_vp_key(monkeypatch) -> None:
+    calls = _vp_bridge_environment(monkeypatch, {"api_token": "x" * 16, "camera_password": "ChangedOnCamera1"})
+    monkeypatch.setattr(entrypoint, "resolve_vp_password_salt", lambda *_: pytest.fail("key not needed"))
+    bridge = entrypoint.configure_bridge(_vp_device(), "parking")
+    assert bridge is not None
+    assert calls["build"]["password_override"] == "ChangedOnCamera1"

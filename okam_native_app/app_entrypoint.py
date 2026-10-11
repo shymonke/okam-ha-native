@@ -225,18 +225,24 @@ def load_lens_counts() -> dict[str, int]:
     }
 
 
+_LENSES_LOCK = threading.Lock()
+
+
 def save_lens_count(alias: str, count: int) -> None:
-    counts = load_lens_counts()
-    if counts.get(alias) == count:
-        return
-    counts[alias] = count
-    try:
-        LENSES_FILE.parent.mkdir(parents=True, exist_ok=True)
-        temporary = LENSES_FILE.with_suffix(".tmp")
-        temporary.write_text(json.dumps(counts, sort_keys=True), encoding="utf-8")
-        temporary.replace(LENSES_FILE)
-    except OSError:
-        return
+    # Camera pump threads report lenses concurrently; serialize the whole
+    # read-modify-replace so one update cannot overwrite another.
+    with _LENSES_LOCK:
+        counts = load_lens_counts()
+        if counts.get(alias) == count:
+            return
+        counts[alias] = count
+        try:
+            LENSES_FILE.parent.mkdir(parents=True, exist_ok=True)
+            temporary = LENSES_FILE.with_suffix(".tmp")
+            temporary.write_text(json.dumps(counts, sort_keys=True), encoding="utf-8")
+            temporary.replace(LENSES_FILE)
+        except OSError:
+            return
     print(f"camera_lenses={count}", flush=True)
 
 
@@ -338,7 +344,12 @@ def resolve_guest_tokens(options: dict[str, object]) -> dict[str, str]:
 
 
 def _valid_token(value: object) -> bool:
-    return isinstance(value, str) and 16 <= len(value) <= 1024
+    # Printable ASCII without spaces: tokens travel in headers and links.
+    return (
+        isinstance(value, str)
+        and 16 <= len(value) <= 1024
+        and all(33 <= ord(character) <= 126 for character in value)
+    )
 
 
 def resolve_api_token(options: dict[str, object]) -> str | None:
@@ -524,8 +535,6 @@ def camera_aliases(devices: list[AccountDevice]) -> list[str]:
 
     options = load_options()
     configured = options.get("camera_id")
-    if len(devices) == 1 and isinstance(configured, str) and configured:
-        return [configured]
     try:
         saved = json.loads(ALIASES_FILE.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -535,6 +544,17 @@ def camera_aliases(devices: list[AccountDevice]) -> list[str]:
         for key, value in saved.items()
     ):
         raise RuntimeError("camera alias state is invalid")
+    if len(devices) == 1 and isinstance(configured, str) and configured:
+        # Remember the lone camera's alias too, so adding a second camera
+        # later does not rename it. An established mapping wins, and the
+        # configured alias is never taken from another camera.
+        key = hashlib.sha256(devices[0].uid.encode("utf-8")).hexdigest()
+        if key in saved:
+            return [saved[key]]
+        if configured not in saved.values():
+            saved[key] = configured
+            _write_aliases(saved)
+            return [configured]
     aliases: list[str] = []
     used: set[str] = set(saved.values())
     for device in devices:
@@ -551,11 +571,15 @@ def camera_aliases(devices: list[AccountDevice]) -> list[str]:
         used.add(alias)
         saved[key] = alias
         aliases.append(alias)
+    _write_aliases(saved)
+    return aliases
+
+
+def _write_aliases(saved: dict[str, str]) -> None:
     ALIASES_FILE.parent.mkdir(parents=True, exist_ok=True)
     temporary = ALIASES_FILE.with_suffix(".tmp")
     temporary.write_text(json.dumps(saved, sort_keys=True), encoding="utf-8")
     temporary.replace(ALIASES_FILE)
-    return aliases
 
 
 def p2p_environment() -> dict[str, str]:
@@ -754,7 +778,13 @@ def vp_stream_launcher(device: AccountDevice, options: dict[str, object]):
         token = ACCOUNT_SESSION.get("token")
     if not isinstance(user_id, str) or not isinstance(token, str):
         raise P2PError("VP account session is unavailable")
-    password_salt = resolve_vp_password_salt(options, [(device.security or "", user_id)])
+    override = options.get("camera_password")
+    override = override if isinstance(override, str) and override else None
+    # A configured camera password makes decrypting the account's one, and
+    # therefore the key, unnecessary.
+    password_salt = "" if override else resolve_vp_password_salt(
+        options, [(device.security or "", user_id)]
+    )
     if password_salt is None:
         report_missing(["vp_password_salt"], "vp_password_salt_required")
         raise P2PError("VP camera password salt is not configured")
@@ -765,7 +795,7 @@ def vp_stream_launcher(device: AccountDevice, options: dict[str, object]):
         library = b""
     inputs = build_worker_inputs(
         connection=connection, user_id=user_id, token=token, security=device.security or "",
-        password_salt=password_salt, library=library,
+        password_salt=password_salt, library=library, password_override=override,
     )
 
     def launch() -> subprocess.Popen[bytes]:

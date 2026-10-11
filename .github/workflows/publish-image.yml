@@ -2,28 +2,13 @@ name: Publish native bridge image
 
 on:
   push:
-    branches: [main]
-    paths:
-      - "okam_native_app/**"
-      - "src/okam_native/**"
-      - "native/android_compat/**"
-      - "native/hybris_probe/**"
-      - "native/hybris_connect/**"
-      - "native/amd64_connect/**"
-      - "tools/fetch_official_sdk.py"
-      - "docs/vendor-artifacts.json"
-      - ".github/workflows/publish-image.yml"
+    tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag_suffix:
-        description: "Suffix for a test build, e.g. test1. Empty publishes the plain version."
-        required: false
+        description: "Required suffix for a test build, e.g. test1."
+        required: true
         default: ""
-      move_latest:
-        description: "Also move the latest tag. Ignored unless run from main."
-        type: boolean
-        required: false
-        default: false
 
 permissions:
   contents: read
@@ -34,6 +19,17 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e ".[test]"
+      - run: python -m pytest
+
   prepare:
     runs-on: ubuntu-latest
     outputs:
@@ -46,26 +42,33 @@ jobs:
         shell: bash
         env:
           TAG_SUFFIX: ${{ inputs.tag_suffix }}
-          REQUEST_LATEST: ${{ inputs.move_latest }}
         run: |
           set -eu
           base="$(sed -n 's/^version: //p' okam_native_app/config.yaml)"
-          if [ -n "${TAG_SUFFIX:-}" ]; then
-            echo "version=${base}-${TAG_SUFFIX}" >> "$GITHUB_OUTPUT"
-          else
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            if [ "${GITHUB_REF_NAME#v}" != "$base" ]; then
+              echo "Release tag must match the app version." >&2
+              exit 1
+            fi
             echo "version=${base}" >> "$GITHUB_OUTPUT"
+          else
+            if [ -z "${TAG_SUFFIX:-}" ]; then
+              echo "Manual builds require a test suffix." >&2
+              exit 1
+            fi
+            echo "version=${base}-${TAG_SUFFIX}" >> "$GITHUB_OUTPUT"
           fi
-          # latest must only ever follow main. A test build published from a
-          # branch must not repoint the tag that installations track.
-          if [ "${GITHUB_REF}" = "refs/heads/main" ] \
-             && { [ "${GITHUB_EVENT_NAME}" = "push" ] || [ "${REQUEST_LATEST:-false}" = "true" ]; }; then
+          # Only a pushed plain version tag may move latest.
+          if [ "${GITHUB_EVENT_NAME}" = "push" ] \
+             && [[ "${GITHUB_REF}" == refs/tags/v* ]] \
+             && [[ "$base" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "move_latest=true" >> "$GITHUB_OUTPUT"
           else
             echo "move_latest=false" >> "$GITHUB_OUTPUT"
           fi
 
   build:
-    needs: prepare
+    needs: [prepare, tests]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -103,7 +106,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.ha_arch }}
 
   publish:
-    needs: [prepare, build]
+    needs: [prepare, tests, build]
     runs-on: ubuntu-latest
     steps:
       - uses: docker/setup-buildx-action@v3

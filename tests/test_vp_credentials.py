@@ -112,3 +112,11 @@ def test_password_salt_absent_from_the_client_fails_closed():
         select_password_salt(_fake_client(), records)
     with pytest.raises(VPError):
         select_password_salt(b"", records)
+
+
+def test_configured_camera_password_overrides_the_account_password():
+    inputs = build_worker_inputs(
+        connection="TEST%%" + record(), user_id="123456789", token="tok",
+        security=encrypt_password(b"Abc123def456ghi", "123456789"),
+        password_salt=SALT, library=b"", password_override="ChangedOnCamera1")
+    assert inputs.worker_config()["password"] == "ChangedOnCamera1"

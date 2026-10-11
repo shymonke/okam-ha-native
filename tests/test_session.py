@@ -309,3 +309,84 @@ def test_session_refuses_a_lens_the_camera_has_not_shown() -> None:
     with pytest.raises(P2PError):
         session.acquire(1)
     session.close()
+
+
+def test_an_old_helper_ending_late_does_not_end_the_new_viewers() -> None:
+    old, new = FakeProcess(), FakeProcess()
+    processes = iter([old, new])
+    session = NativeStreamSession(lambda: next(processes), idle_timeout=60)  # type: ignore[arg-type]
+    first = session.acquire()
+    # The old helper exits but its pump has not finished cleaning up yet.
+    old.returncode = 0
+    second = session.acquire()  # starts the replacement helper
+    first.close()
+    old.terminate()  # now the old pump finishes
+    deadline = time.monotonic() + 2
+    while session.status().viewers != 1 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    time.sleep(0.1)
+    assert session.status().viewers == 1
+    second.close()
+    session.close()
+
+
+def test_idle_stop_detaches_so_a_late_viewer_gets_a_fresh_helper() -> None:
+    first_process, second_process = FakeProcess(), FakeProcess()
+    processes = iter([first_process, second_process])
+    session = NativeStreamSession(lambda: next(processes), idle_timeout=0.01)  # type: ignore[arg-type]
+    session.acquire().close()
+    deadline = time.monotonic() + 2
+    while first_process.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    late = session.acquire()
+    assert session.status().running and session.status().viewers == 1
+    late.close()
+    session.close()
+
+
+def test_a_replaced_helper_cannot_feed_the_next_generation() -> None:
+    old, new = FakeProcess(), FakeProcess()
+    processes = iter([old, new])
+    session = NativeStreamSession(lambda: next(processes), idle_timeout=60)  # type: ignore[arg-type]
+    first = session.acquire()
+    old.returncode = 0          # old helper exited; its pump is still reading
+    viewer = session.acquire()  # starts the replacement
+    first.close()
+    old.stdout.chunks.put(b"\x00\x00\x01\x67stale")  # late bytes from the old helper
+    time.sleep(0.2)
+    assert session.status().media_ready is False
+    new.stdout.chunks.put(b"\x00\x00\x01\x65fresh")
+    assert next(iter(viewer)) == b"\x00\x00\x01\x65fresh"
+    viewer.close()
+    old.terminate()
+    session.close()
+
+
+def test_a_subscription_ends_when_media_stops_arriving(monkeypatch) -> None:
+    import okam_native.session as session_module
+
+    monkeypatch.setattr(session_module, "MEDIA_WAIT_SECONDS", 0.05)
+    session = NativeStreamSession(lambda: FakeProcess(), idle_timeout=60)  # type: ignore[arg-type]
+    subscription = session.acquire()
+    assert list(subscription) == []
+    subscription.close()
+    session.close()
+
+
+def test_viewers_keep_waiting_through_an_always_on_retry(monkeypatch) -> None:
+    import okam_native.session as session_module
+
+    monkeypatch.setattr(session_module, "MEDIA_WAIT_SECONDS", 0.05)
+    session = NativeStreamSession(lambda: FakeProcess(), always_on=True, retry_delay=60)  # type: ignore[arg-type]
+    with session._lock:
+        session._schedule_retry_locked(media_seen=False)
+    subscription = session.acquire()
+    chunks = iter(subscription)
+    result: list[bytes] = []
+    reader = threading.Thread(target=lambda: result.extend(chunks), daemon=True)
+    reader.start()
+    time.sleep(0.3)
+    assert reader.is_alive()  # still waiting while the retry is pending
+    session.close()
+    subscription.close()
+    reader.join(timeout=2)

@@ -26,6 +26,8 @@ MAX_SCAN_BYTES = 4 * 1024 * 1024
 # reached by doubling while the camera keeps failing before any media.
 ALWAYS_ON_RETRY_SECONDS = 5.0
 ALWAYS_ON_MAX_RETRY_SECONDS = 300.0
+# Longest wait for the next media chunk, covering camera wake-up and connect.
+MEDIA_WAIT_SECONDS = 90.0
 
 
 @dataclass(frozen=True)
@@ -62,7 +64,15 @@ class StreamSubscription:
 
     def __iter__(self) -> Iterator[bytes]:
         while not self._closed:
-            chunk = self._chunks.get()
+            try:
+                # Bounded: a stalled stream must free its viewer and handler.
+                chunk = self._chunks.get(timeout=MEDIA_WAIT_SECONDS)
+            except queue.Empty:
+                # Keep waiting through an always-on reconnect backoff; end
+                # only when no helper is expected to deliver media.
+                if self._owner.retry_pending():
+                    continue
+                return
             if chunk is _END:
                 return
             assert isinstance(chunk, bytes)
@@ -118,6 +128,7 @@ class NativeStreamSession:
         self._last_error: str | None = None
         self._media_ready = False
         self._media: dict[int, _LensMedia] = {}
+        self._detached: subprocess.Popen[bytes] | None = None
         self._closed = False
 
     @property
@@ -274,6 +285,10 @@ class NativeStreamSession:
         preamble = media.sps + media.pps + media.keyframe
         return preamble if len(preamble) <= MAX_PREAMBLE_BYTES else b""
 
+    def retry_pending(self) -> bool:
+        with self._lock:
+            return self.always_on and self._retry_timer is not None and not self._closed
+
     def status(self) -> SessionStatus:
         with self._lock:
             return SessionStatus(
@@ -340,6 +355,10 @@ class NativeStreamSession:
         try:
             for lens, chunk in self._read_media(process):
                 with self._lock:
+                    if self._process is not process:
+                        # Replaced or detached: its media must not reach the
+                        # next generation's viewers or preamble.
+                        break
                     self._media_ready = True
                     self._note_media(chunk, lens)
                     grew = lens >= self._lenses
@@ -368,13 +387,21 @@ class NativeStreamSession:
             process.wait()
             stderr_thread.join(timeout=2)
             with self._lock:
-                subscribers = tuple(chunks for _lens, chunks in self._subscribers.values())
-                self._subscribers.clear()
-                if self._process is process:
+                # Only the current generation may end its viewers. A viewer
+                # can already have started a replacement helper (or idle stop
+                # detached this one); its subscribers belong to that one.
+                current = self._process is process
+                subscribers: tuple[queue.Queue[bytes | object], ...] = ()
+                if current or self._process is None and self._detached is process:
+                    subscribers = tuple(chunks for _lens, chunks in self._subscribers.values())
+                    self._subscribers.clear()
+                    self._parse_summary_locked(process.returncode)
+                if current:
                     self._process = None
                     if self.always_on and not self._closed:
                         self._schedule_retry_locked(media_seen=self._media_ready)
-                self._parse_summary_locked(process.returncode)
+                if self._detached is process:
+                    self._detached = None
             for chunks in subscribers:
                 try:
                     chunks.put_nowait(_END)
@@ -405,6 +432,12 @@ class NativeStreamSession:
             if not chunk:
                 return
             with self._lock:
+                # A detached helper may log only while nothing replaced it.
+                if not (
+                    self._process is process
+                    or (self._process is None and self._detached is process)
+                ):
+                    continue
                 remaining = MAX_RESPONSE_BYTES - len(self._stderr)
                 if remaining > 0:
                     self._stderr.extend(chunk[:remaining])
@@ -444,6 +477,10 @@ class NativeStreamSession:
             if self._subscribers or self._closed or self.always_on:
                 return
             process = self._process
+            # Detach under the lock, so a viewer arriving while this helper
+            # terminates starts a fresh one instead of joining a dying one.
+            self._process = None
+            self._detached = process
         self._terminate(process)
 
     @staticmethod

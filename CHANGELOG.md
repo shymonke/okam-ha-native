@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.3.1
+
+- Watch cameras in a browser: `http://HOST:8099/view?token=...` shows every
+  lens live (MJPEG), and read-only links may carry the token as `?token=`.
+- Stream URLs survive bridge restarts (Home Assistant no longer needs a reload
+  after the app restarts), and revoking a guest token also revokes the stream
+  URLs it obtained.
+- Fixes viewers or FFmpeg processes leaking when a client disconnects while
+  the camera wakes, a race where a late helper exit ended the next viewers,
+  and VP streams that hung silently after the relay stopped sending video.
+- Caps concurrent connections, media streams and socket waits to protect
+  small hosts.
+- A lone camera's alias is remembered, so adding a camera no longer renames
+  it; lens counts are saved safely from several cameras at once.
+- Non-ASCII tokens can no longer break authentication; `camera_password` now
+  also applies to VP cameras.
+- The integration retries while the bridge starts and asks for a new token on
+  authentication failure; reconfiguring updates the entry's identity.
+- Release images are published only from version tags, after the tests pass.
+
 ## 1.3.0
 
 - Supports newer O-KAM VP cameras (for example dual-lens `VE` models) over the

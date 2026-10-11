@@ -119,8 +119,8 @@ which commonly takes 20–30 seconds. Multiple viewers share one camera
 connection. After the final viewer closes, the bridge stops and disconnects
 after the configured idle timeout. The 120-second default allows brief page
 changes and reloads to reuse the warm connection. Installations created before
-version 1.1.1 retain their selected value; use the integration's **Configure**
-action to change an older 30-second value to 120 seconds.
+version 1.1.1 retain their selected value; use the **Reconfigure** action in the
+integration entry's menu (⋮) to change an older 30-second value to 120 seconds.
 
 Do not expose TCP port 8099 to the internet. See the repository
 [README](https://github.com/shymonke/okam-ha-native#readme) and

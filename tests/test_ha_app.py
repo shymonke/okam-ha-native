@@ -21,7 +21,7 @@ def test_native_bridge_is_a_prebuilt_64_bit_ha_app() -> None:
     assert "boot: auto" in config
     assert "stage: experimental" not in config
     assert "machine:" not in config
-    assert "version: 1.3.0" in config
+    assert "version: 1.3.1" in config
     assert "idle_timeout_seconds: 120" in config
     assert "account_username: email?" in config
     assert "account_password: password?" in config
@@ -85,7 +85,7 @@ def test_repository_contains_camera_integration_for_native_api() -> None:
     manifest = (component / "manifest.json").read_text(encoding="utf-8")
     config_flow = (component / "config_flow.py").read_text(encoding="utf-8")
     camera = (component / "camera.py").read_text(encoding="utf-8")
-    assert '"version": "1.3.0"' in manifest
+    assert '"version": "1.3.1"' in manifest
     assert "http://homeassistant.local:8099" in config_flow
     assert "CameraEntityFeature.STREAM" in camera
     assert "_attr_has_entity_name = False" in camera
@@ -164,14 +164,18 @@ def test_image_ffmpeg_can_mux_the_live_stream() -> None:
     assert "--enable-demuxer=h264" in dockerfile
 
 
-def test_latest_tag_only_ever_follows_main() -> None:
+def test_latest_tag_only_ever_follows_plain_release_tags() -> None:
     # A test build published from a branch must not repoint the tag that
     # installations track.
     workflow = (ROOT / ".github" / "workflows" / "publish-image.yml").read_text(
         encoding="utf-8"
     )
 
-    assert 'GITHUB_REF}" = "refs/heads/main"' in workflow
+    assert '"${GITHUB_EVENT_NAME}" = "push"' in workflow
+    assert '"${GITHUB_REF}" == refs/tags/v*' in workflow
+    assert '"$base" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+$' in workflow
+    assert "refs/heads/main" not in workflow
+    assert "inputs.move_latest" not in workflow
     assert 'if [ "$MOVE_LATEST" = "true" ]' in workflow
     assert "tag_suffix" in workflow
 

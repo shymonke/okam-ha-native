@@ -391,3 +391,144 @@ def test_guest_tokens_can_view_but_not_change_settings() -> None:
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_browser_viewer_and_links_accept_a_token_for_viewing_only() -> None:
+    session = FakeSession(lenses=2)
+    bridge = CameraBridge(
+        camera_id="cabin",
+        camera_name="Cabin",
+        api_token="safe-api-token-123",
+        session=session,  # type: ignore[arg-type]
+        ffmpeg="/nonexistent/ffmpeg",
+        guest_tokens={"friend": "guest-token-abcdefgh"},
+    )
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0), make_handler(lambda: {}, lambda: {"cabin": bridge})
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        assert request(server, "GET", "/view")[0] == 401
+        assert request(server, "GET", "/view?token=wrong-token-123")[0] == 401
+        code, headers, page = request(server, "GET", "/view?token=guest-token-abcdefgh")
+        assert code == 200
+        html = page.decode("utf-8")
+        assert html.count("<img ") == 2
+        assert "/api/cameras/cabin/stream.mjpeg?lens=1&amp;token=guest-token-abcdefgh" in html or (
+            "/api/cameras/cabin/stream.mjpeg?lens=1&token=guest-token-abcdefgh" in html
+        )
+        code, _, _ = request(
+            server, "GET", "/api/cameras/cabin/snapshot.jpg?lens=1&token=guest-token-abcdefgh"
+        )
+        assert code == 200 and session.lens_requests[-1] == 1
+        assert request(server, "GET", "/api/devices?token=guest-token-abcdefgh")[0] == 200
+        # A link token never authorizes changes.
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+        body = json.dumps({"idle_timeout_seconds": 60})
+        connection.request(
+            "PATCH", "/api/cameras/cabin/config?token=safe-api-token-123", body=body,
+            headers={"Content-Type": "application/json"},
+        )
+        assert connection.getresponse().status == 401
+        connection.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_multipart_jpeg_frames_split_chunks_and_limit_the_rate() -> None:
+    from okam_native.bridge import multipart_jpeg
+
+    jpeg = b"\xff\xd8body\xff\xd9"
+    stream = b"junk" + jpeg * 4
+    chunks = [stream[:7], stream[7:19], stream[19:]]
+    times = iter([0.0, 0.1, 0.25, 0.5])
+    parts = list(multipart_jpeg(iter(chunks), fps=5, clock=lambda: next(times)))
+    # Frames at 0.0, 0.25 and 0.5 s pass a 5 fps limit; the one at 0.1 s is dropped.
+    assert len(parts) == 3
+    assert parts[0].startswith(b"--okamframe\r\nContent-Type: image/jpeg\r\n")
+    assert parts[0].endswith(jpeg + b"\r\n")
+
+
+def _bridge(**kwargs) -> CameraBridge:
+    return CameraBridge(
+        camera_id="cabin",
+        camera_name="Cabin",
+        api_token=kwargs.pop("api_token", "safe-api-token-123"),
+        session=FakeSession(),  # type: ignore[arg-type]
+        ffmpeg="/nonexistent/ffmpeg",
+        **kwargs,
+    )
+
+
+def test_stream_urls_survive_restarts_and_die_with_their_token() -> None:
+    from urllib.parse import parse_qs, urlsplit
+
+    def stream_token(url: str) -> str:
+        return parse_qs(urlsplit(url).query)["token"][0]
+
+    first = _bridge(guest_tokens={"friend": "guest-token-abcdefgh"})
+    restarted = _bridge(guest_tokens={"friend": "guest-token-abcdefgh"})
+    main_url = first.stream_url("bridge:8099")
+    # A restarted bridge accepts the URL Home Assistant cached earlier.
+    assert restarted.stream_authenticated(stream_token(main_url))
+
+    guest_url = first.stream_url("bridge:8099", 0, "Bearer guest-token-abcdefgh")
+    assert stream_token(guest_url) != stream_token(main_url)
+    revoked = _bridge(guest_tokens={})
+    assert not revoked.stream_authenticated(stream_token(guest_url))
+    assert revoked.stream_authenticated(stream_token(main_url))
+    assert not _bridge(api_token="rotated-api-token-456").stream_authenticated(stream_token(main_url))
+
+
+def test_non_ascii_tokens_never_break_authentication() -> None:
+    bridge = _bridge(guest_tokens={"odd": "guest-token-ééééé"})
+    assert bridge.authenticated("Bearer safe-api-token-123")
+    assert not bridge.authenticated("Bearer ünicode-token-value")
+    assert not bridge.stream_authenticated("ünicode")
+
+
+def test_multipart_jpeg_keeps_a_start_marker_split_across_reads() -> None:
+    from okam_native.bridge import multipart_jpeg
+
+    jpeg = b"\xff\xd8body\xff\xd9"
+    for split in range(1, len(jpeg)):
+        parts = list(multipart_jpeg(iter([b"xx" + jpeg[:split], jpeg[split:]]), fps=1000))
+        assert len(parts) == 1, split
+
+
+def test_media_slots_are_released_even_when_acquisition_fails_unexpectedly() -> None:
+    import okam_native.bridge as bridge_module
+
+    class Exploding(FakeSession):
+        def acquire(self, lens: int = 0):
+            raise OSError("unexpected")
+
+    bridge = CameraBridge(
+        camera_id="cabin", camera_name="Cabin", api_token="safe-api-token-123",
+        session=Exploding(), ffmpeg="/nonexistent/ffmpeg",  # type: ignore[arg-type]
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(lambda: {}, lambda: {"cabin": bridge}))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        for _ in range(bridge_module.MAX_MEDIA_STREAMS + 2):
+            try:
+                request(server, "GET", "/api/cameras/cabin/stream.mjpeg?token=safe-api-token-123")
+            except Exception:
+                pass
+        # Every slot came back: a fresh acquire still succeeds.
+        assert bridge_module._MEDIA_SLOTS.acquire(blocking=False)
+        bridge_module._MEDIA_SLOTS.release()
+        acquired = 0
+        while bridge_module._MEDIA_SLOTS.acquire(blocking=False):
+            acquired += 1
+        for _ in range(acquired):
+            bridge_module._MEDIA_SLOTS.release()
+        assert acquired == bridge_module.MAX_MEDIA_STREAMS
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)

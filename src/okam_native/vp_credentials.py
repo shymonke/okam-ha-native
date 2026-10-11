@@ -158,10 +158,14 @@ def select_password_salt(client: bytes, records: list[tuple[str, str]]) -> str:
 
 
 def build_worker_inputs(*, connection: str, user_id: str, token: str, security: str,
-                        password_salt: str, library: bytes) -> VPWorkerInputs:
+                        password_salt: str, library: bytes,
+                        password_override: str | None = None) -> VPWorkerInputs:
+    # A configured camera password (changed on the camera) wins over the one
+    # the account hands back.
+    password = password_override or decrypt_camera_password(security, user_id, password_salt)
     return VPWorkerInputs(
         connection=connection,
         authentication=vp_authentication(user_id, token),
-        password=decrypt_camera_password(security, user_id, password_salt),
+        password=password,
         checksum_salt=select_checksum_salt(library, connection),
     )

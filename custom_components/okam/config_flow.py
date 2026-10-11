@@ -200,7 +200,15 @@ class OkamConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             except ValueError:
                 errors["base"] = "camera_not_found"
             else:
-                return self.async_update_reload_and_abort(entry, data=data)
+                unique_id = f"{data[CONF_BRIDGE_URL].lower()}#{data[CONF_CAMERA_ID]}"
+                if any(
+                    other.unique_id == unique_id and other.entry_id != entry.entry_id
+                    for other in self._async_current_entries(include_ignore=False)
+                ):
+                    return self.async_abort(reason="already_configured")
+                return self.async_update_reload_and_abort(
+                    entry, data=data, unique_id=unique_id
+                )
         return self.async_show_form(
             step_id="reconfigure", data_schema=_schema(entry.data), errors=errors
         )

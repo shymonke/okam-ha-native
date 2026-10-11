@@ -204,3 +204,19 @@ def test_video_lens_reads_header_offset_26():
     assert video_lens(bytes(header)) == 1
     with pytest.raises(VPError):
         video_lens(b'short')
+
+
+def test_worker_ends_when_media_stalls_after_starting(monkeypatch):
+    config, state = prepare(monkeypatch)
+    config.pop('max_frames')
+    frames = iter([(b'\x00\x00\x00\x01\x65\x01', True, 0)])
+    def media(*_, **__):
+        try:
+            return next(frames)
+        except StopIteration:
+            raise VPTimeout('synthetic silence') from None
+    monkeypatch.setattr(helper, 'read_video_frame', media)
+    monkeypatch.setattr(helper, 'MEDIA_STALL_SECONDS', 0)
+    code, result = helper.run(config, io.BytesIO(), session_factory=lambda *_: state)
+    # A silent relay must end the worker so the session can reconnect.
+    assert code == 1 and result['failure_stage'] == 'read_media' and state.closed
