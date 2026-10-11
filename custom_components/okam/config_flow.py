@@ -68,11 +68,67 @@ async def _validate(hass, data: dict[str, Any]) -> dict[str, Any]:
 class OkamConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     VERSION = 1
 
-    async def async_step_user(self, user_input=None):
+    _discovered: dict[str, Any] | None = None
+
+    async def async_step_hassio(self, discovery_info):
+        """Accept the bridge announced by the app through Supervisor discovery."""
+
+        config = discovery_info.config
+        discovered = {
+            CONF_BRIDGE_URL: f"http://{config['host']}:{config['port']}",
+            CONF_API_TOKEN: config["api_token"],
+        }
+        # A reinstalled app generates a new token; repair existing entries
+        # for the same bridge instead of leaving them unauthenticated.
+        for entry in self._async_current_entries(include_ignore=False):
+            if entry.data.get(CONF_BRIDGE_URL) == discovered[CONF_BRIDGE_URL] and (
+                entry.data.get(CONF_API_TOKEN) != discovered[CONF_API_TOKEN]
+            ):
+                self.hass.config_entries.async_update_entry(
+                    entry, data={**entry.data, **discovered}
+                )
+                self.hass.config_entries.async_schedule_reload(entry.entry_id)
+        self._discovered = discovered
+        self.context["title_placeholders"] = {"name": "O-KAM Native Bridge"}
+        return await self.async_step_hassio_confirm()
+
+    async def _unconfigured_cameras(self, base: dict[str, Any]) -> list[str]:
+        api = OkamApi(
+            async_get_clientsession(self.hass), base[CONF_BRIDGE_URL], base[CONF_API_TOKEN]
+        )
+        devices = await api.devices()
+        configured = {
+            entry.unique_id for entry in self._async_current_entries(include_ignore=False)
+        }
+        url = base[CONF_BRIDGE_URL].lower()
+        return [
+            item["camera_id"]
+            for item in devices
+            if item.get("camera_id") and f"{url}#{item['camera_id']}" not in configured
+        ]
+
+    async def async_step_hassio_confirm(self, user_input=None):
+        assert self._discovered is not None
         errors: dict[str, str] = {}
+        try:
+            cameras = await self._unconfigured_cameras(self._discovered)
+        except OkamAuthError:
+            return self.async_abort(reason="invalid_auth")
+        except OkamApiError:
+            return self.async_abort(reason="cannot_connect")
+        if not cameras:
+            return self.async_abort(reason="already_configured")
         if user_input is not None:
             try:
-                data = await _validate(self.hass, user_input)
+                data = await _validate(
+                    self.hass,
+                    {
+                        **self._discovered,
+                        CONF_CAMERA_ID: user_input[CONF_CAMERA_ID],
+                        CONF_IDLE_TIMEOUT: DEFAULT_IDLE_TIMEOUT,
+                        CONF_SNAPSHOT_INTERVAL: DEFAULT_SNAPSHOT_INTERVAL,
+                    },
+                )
             except OkamAuthError:
                 errors["base"] = "invalid_auth"
             except OkamApiError:
@@ -80,9 +136,53 @@ class OkamConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             except ValueError:
                 errors["base"] = "camera_not_found"
             else:
-                await self.async_set_unique_id(data[CONF_BRIDGE_URL].lower())
+                await self.async_set_unique_id(
+                    f"{data[CONF_BRIDGE_URL].lower()}#{data[CONF_CAMERA_ID]}"
+                )
                 self._abort_if_unique_id_configured()
                 return self.async_create_entry(title="O-KAM Native Bridge", data=data)
+        schema = vol.Schema(
+            {
+                vol.Required(CONF_CAMERA_ID, default=cameras[0]): selector.SelectSelector(
+                    selector.SelectSelectorConfig(options=cameras)
+                )
+            }
+        )
+        return self.async_show_form(
+            step_id="hassio_confirm", data_schema=schema, errors=errors
+        )
+
+    async def async_step_user(self, user_input=None):
+        errors: dict[str, str] = {}
+        if user_input is None:
+            # Adding another camera from the same bridge: reuse its URL and
+            # token so only the camera has to be chosen.
+            existing = self._async_current_entries(include_ignore=False)
+            if existing:
+                user_input = {
+                    CONF_BRIDGE_URL: existing[0].data[CONF_BRIDGE_URL],
+                    CONF_API_TOKEN: existing[0].data[CONF_API_TOKEN],
+                }
+            return self.async_show_form(
+                step_id="user", data_schema=_schema(user_input), errors=errors
+            )
+        try:
+            data = await _validate(self.hass, user_input)
+        except OkamAuthError:
+            errors["base"] = "invalid_auth"
+        except OkamApiError:
+            errors["base"] = "cannot_connect"
+        except ValueError:
+            errors["base"] = "camera_not_found"
+        else:
+            # A bridge can serve several cameras, so the entry is unique per
+            # camera, not per bridge. Otherwise a second camera could never
+            # be added against the same bridge URL.
+            await self.async_set_unique_id(
+                f"{data[CONF_BRIDGE_URL].lower()}#{data[CONF_CAMERA_ID]}"
+            )
+            self._abort_if_unique_id_configured()
+            return self.async_create_entry(title="O-KAM Native Bridge", data=data)
         return self.async_show_form(
             step_id="user", data_schema=_schema(user_input), errors=errors
         )

@@ -2,16 +2,7 @@
 
 ## Supported versions
 
-Security fixes are provided for the latest published release. The current
-release is the independent `0.1.0-preview1` preview snapshot; its prebuilt
-multi-architecture image is published to GitHub Container Registry at
-`ghcr.io/shymonke/okam-ha-native`.
-
-## Supported scope
-
-Only the single-camera O-KAM Pro / CS2 bridge is supported. VP-series cameras
-may be enumerated but cannot be streamed, and PTZ and IR control are not
-implemented. Security reports are accepted for the supported path only.
+Security fixes are provided for the latest published release.
 
 ## Reporting a vulnerability
 

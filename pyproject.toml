@@ -3,24 +3,24 @@ requires = ["setuptools>=75"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "okam-ha-native"
-version = "0.1.0-preview1"
+name = "okam-native"
+version = "1.2.0"
 description = "Native O-KAM Pro camera bridge for Home Assistant"
 readme = "README.md"
+authors = [{ name = "shymonke" }]
 requires-python = ">=3.11"
 license = {file = "LICENSE"}
 dependencies = []
 
-[project.urls]
-Homepage = "https://github.com/shymonke/okam-ha-native"
-Issues = "https://github.com/shymonke/okam-ha-native/issues"
-
 [project.optional-dependencies]
+vp = ["cryptography>=44,<47"]
+cli = ["keyring>=25,<26", "av>=14,<20", "numpy>=1.26", "pillow>=10", "textual>=8,<9", "textual-image>=0.14,<1"]
 trace = ["frida>=17,<18"]
 inspect = ["pyelftools>=0.31,<1"]
-test = ["pytest>=8,<9", "pyelftools>=0.31,<1"]
+test = ["pytest>=8,<9", "pyelftools>=0.31,<1", "cryptography>=44,<47", "av>=14,<20", "numpy>=1.26", "pillow>=10", "textual>=8,<9", "textual-image>=0.14,<1"]
 
 [project.scripts]
+okam = "okam_native.cli:main"
 okam-acceptance = "okam_native.acceptance:main"
 
 [tool.setuptools.packages.find]

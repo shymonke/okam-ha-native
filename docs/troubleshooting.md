@@ -25,16 +25,19 @@ Confirm that all required values are present:
 
 Do not use the O-KAM password as the local API token.
 
-## Account enumeration does not find one camera
+## Account enumeration does not find a camera
 
-The configured O-KAM account must show exactly one camera. It may be the normal
-camera-owner account or an account to which the camera was shared.
+The bridge serves every camera the configured O-KAM account can see, and it may
+be the normal camera-owner account or an account to which cameras were shared.
 
 1. Sign in to the configured account in the O-KAM mobile app.
-2. Confirm that the camera is visible and live view works.
-3. Remove any additional cameras from that account or use an account containing
-   only the intended camera.
+2. Confirm that at least one camera is visible and live view works.
+3. If the account shows no cameras at all, share a camera to it from the owning
+   account, or use the owning account.
 4. Save the Home Assistant app configuration and restart the app.
+
+The startup log reports how many cameras were found, for example
+`account_enumerated=true device_count=2`.
 
 ## Camera authentication fails
 
@@ -48,13 +51,8 @@ did not return. Enter that known local camera password in `camera_password`,
 save, and restart the app. This value is not the O-KAM account password or the
 bridge API token. Do not post it in an issue.
 
-## The camera enumerates but never streams
-
-Only the single-camera O-KAM Pro (CS2) path is supported. VP-series cameras may
-be found during account enumeration but cannot be streamed; no setting enables
-them. PTZ (pan/tilt/zoom) and IR / night-vision control are also not
-implemented. If your camera is not an O-KAM Pro / CS2 model, it is outside the
-supported scope.
+The older startup message `camera_device_credential_was_unavailable` is handled
+by version 1.2.0 and later; update the app before further troubleshooting.
 
 ## The integration cannot connect
 
@@ -77,8 +75,8 @@ to start wake-up. The waking-up image remains visible while the camera connects;
 this commonly takes 20–30 seconds. Keep live view open for at least 45 seconds
 on the first attempt.
 
-If the waking-up image remains after a snapshot is available, restart both the
-app and Home Assistant.
+If the waking-up image remains after a snapshot is available, confirm that both
+the app and integration are version 1.1.1 or newer, then restart Home Assistant.
 
 If it remains blank:
 

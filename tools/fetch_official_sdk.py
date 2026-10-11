@@ -121,7 +121,7 @@ def main() -> int:
             handle = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
             handle.close()
             temporary = Path(handle.name)
-            request = urllib.request.Request(artifact["url"], headers={"User-Agent": "okam-ha-native/0.0.1"})
+            request = urllib.request.Request(artifact["url"], headers={"User-Agent": "okam-native/0.0.1"})
             with urllib.request.urlopen(request, timeout=60) as response, temporary.open("wb") as target:
                 shutil.copyfileobj(response, target)
             archive = temporary

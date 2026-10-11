@@ -1,19 +1,28 @@
 configuration:
   account_username:
     name: O-KAM account email
-    description: Email address of an O-KAM account that can view exactly one camera.
+    description: Email address of the O-KAM account. Every camera the account can see is served.
   account_password:
     name: O-KAM account password
     description: Password for the O-KAM account.
   api_token:
     name: Local API token
-    description: A random secret of at least 16 characters that you create and also enter in the Home Assistant integration.
+    description: Leave blank. The app creates a secure token, fills it in here (click the eye to see it) and hands it to Home Assistant automatically. Share it only with people you give bridge access to; change it to revoke them.
+  guest_tokens:
+    name: Guest access tokens
+    description: Read-only access for people or programs outside Home Assistant. Add an entry with a name (for example a friend's name) and leave the token blank; after a restart the app fills in a secure token (eye icon). Delete the entry and restart to revoke it.
   camera_id:
     name: Camera alias
-    description: Local Home Assistant name for the camera, for example cabin.
+    description: Local Home Assistant name for a lone camera, for example cabin. Ignored when the account exposes several cameras.
   idle_timeout_seconds:
     name: Idle disconnect delay
     description: Seconds to wait after the final viewer closes before stopping and disconnecting the camera.
+  vp_password_salt:
+    name: VP camera password key
+    description: Normally leave blank. Put the O-KAM PC client file SuperIPCam.exe in this app's config folder and the key is found automatically. Only fill this in if you already know the key.
+  always_on:
+    name: Keep streams always on
+    description: Keep every camera connected without viewers, reconnecting automatically, for continuous recorders such as Frigate. Uses more camera power and data.
   run_connect_test:
     name: Run connection diagnostic
     description: Perform a bounded P2P connection test when the app starts. Leave disabled for normal use.

@@ -21,19 +21,24 @@ class FakeSubscription:
 
 class FakeSession:
     idle_timeout = 30.0
+    always_on = False
 
-    def __init__(self) -> None:
+    def __init__(self, lenses: int = 1) -> None:
         self.subscription = FakeSubscription()
         self.running = False
         self.media_ready = False
+        self.lenses = lenses
+        self.lens_requests: list[int] = []
 
     def status(self) -> SessionStatus:
-        return SessionStatus(self.running, 0, True, None, self.media_ready)
+        return SessionStatus(self.running, 0, True, None, self.media_ready, self.lenses)
 
-    def snapshot(self, _ffmpeg: str):
+    def snapshot(self, _ffmpeg: str, *, lens: int = 0):
+        self.lens_requests.append(lens)
         return b"\xff\xd8jpeg\xff\xd9", 2304, 1296
 
-    def acquire(self) -> FakeSubscription:
+    def acquire(self, lens: int = 0) -> FakeSubscription:
+        self.lens_requests.append(lens)
         return self.subscription
 
 
@@ -69,7 +74,7 @@ def test_bridge_api_is_authenticated_and_exposes_native_camera() -> None:
         "configuration_required": False,
     }
     server = ThreadingHTTPServer(
-        ("127.0.0.1", 0), make_handler(lambda: status, lambda: bridge)
+        ("127.0.0.1", 0), make_handler(lambda: status, lambda: {"cabin": bridge})
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -80,7 +85,7 @@ def test_bridge_api_is_authenticated_and_exposes_native_camera() -> None:
             server, "GET", "/api/devices", token="safe-api-token-123"
         )
         assert code == 200
-        assert json.loads(payload) == [{"camera_id": "cabin", "name": "Cabin"}]
+        assert json.loads(payload) == [{"camera_id": "cabin", "lenses": 1, "name": "Cabin"}]
 
         code, _, payload = request(
             server,
@@ -136,7 +141,7 @@ def test_bridge_idle_timeout_is_bounded() -> None:
     )
     server = ThreadingHTTPServer(
         ("127.0.0.1", 0),
-        make_handler(lambda: {"loader_ready": True, "camera_ready": True}, lambda: bridge),
+        make_handler(lambda: {"loader_ready": True, "camera_ready": True}, lambda: {"cabin": bridge}),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -204,3 +209,185 @@ def test_dropped_clients_do_not_report_a_crash(capsys) -> None:
     assert "bridge_request_failed error=ValueError" in captured
     assert "172.30.32.2" not in captured
     assert "Traceback" not in captured
+
+
+def _multi_camera_server():
+    cabin = CameraBridge(
+        camera_id="cabin",
+        camera_name="Cabin",
+        api_token="safe-api-token-123",
+        session=FakeSession(),  # type: ignore[arg-type]
+        ffmpeg="ffmpeg",
+    )
+    gate = CameraBridge(
+        camera_id="gate",
+        camera_name="Gate",
+        api_token="safe-api-token-123",
+        session=FakeSession(),  # type: ignore[arg-type]
+        ffmpeg="ffmpeg",
+    )
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        make_handler(
+            lambda: {"loader_ready": True, "camera_ready": True},
+            lambda: {"cabin": cabin, "gate": gate},
+        ),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread, cabin, gate
+
+
+def test_bridge_serves_several_cameras_from_one_registry() -> None:
+    server, thread, cabin, gate = _multi_camera_server()
+    try:
+        # Auth is required for the device list and for every camera route.
+        assert request(server, "GET", "/api/devices")[0] == 401
+        assert (
+            request(server, "GET", "/api/cameras/cabin/status", token="wrong")[0]
+            == 401
+        )
+
+        code, _, payload = request(
+            server, "GET", "/api/devices", token="safe-api-token-123"
+        )
+        assert code == 200
+        assert json.loads(payload) == [
+            {"camera_id": "cabin", "lenses": 1, "name": "Cabin"},
+            {"camera_id": "gate", "lenses": 1, "name": "Gate"},
+        ]
+
+        # Each camera resolves to its own bridge, never to another one.
+        for camera_id in ("cabin", "gate"):
+            code, _, payload = request(
+                server,
+                "GET",
+                f"/api/cameras/{camera_id}/status",
+                token="safe-api-token-123",
+            )
+            assert code == 200
+            assert json.loads(payload)["camera_id"] == camera_id
+
+        code, _, _ = request(
+            server, "GET", "/api/cameras/shed/status", token="safe-api-token-123"
+        )
+        assert code == 404
+
+        # A stream token is scoped to the camera that issued it.
+        code, _, payload = request(
+            server,
+            "GET",
+            "/api/cameras/gate/stream/source",
+            token="safe-api-token-123",
+        )
+        assert code == 200
+        parsed = urlsplit(json.loads(payload)["stream_url"])
+        assert parsed.path.startswith("/api/cameras/gate/")
+        query = parsed.query
+        # The advertised source is MPEG-TS; the raw elementary stream is what
+        # this test can consume without a real muxer.
+        raw_path = parsed.path.replace("/stream.ts", "/stream.h264")
+        assert request(server, "GET", f"{raw_path}?{query}")[0] == 200
+        assert (
+            request(server, "GET", f"/api/cameras/cabin/stream.h264?{query}")[0]
+            == 401
+        )
+
+        # Only the requested camera's idle timeout changes.
+        code, _, _ = request(
+            server,
+            "PATCH",
+            "/api/cameras/gate/config",
+            token="safe-api-token-123",
+            body={"idle_timeout_seconds": 45},
+        )
+        assert code == 200
+        assert gate.session.idle_timeout == 45.0
+        assert cabin.session.idle_timeout == FakeSession.idle_timeout
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_bridge_routes_the_requested_lens_and_rejects_malformed_ones() -> None:
+    session = FakeSession(lenses=2)
+    bridge = CameraBridge(
+        camera_id="cabin",
+        camera_name="Cabin",
+        api_token="safe-api-token-123",
+        session=session,  # type: ignore[arg-type]
+        ffmpeg="/usr/bin/ffmpeg",
+    )
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0), make_handler(lambda: {}, lambda: {"cabin": bridge})
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        token = "safe-api-token-123"
+        code, _, payload = request(server, "GET", "/api/cameras/cabin/status", token=token)
+        assert code == 200 and json.loads(payload)["lenses"] == 2
+
+        code, _, _ = request(server, "GET", "/api/cameras/cabin/snapshot.jpg?lens=1", token=token)
+        assert code == 200
+        code, _, _ = request(server, "GET", "/api/cameras/cabin/snapshot.jpg", token=token)
+        assert code == 200
+        assert session.lens_requests == [1, 0]
+
+        code, _, payload = request(
+            server, "GET", "/api/cameras/cabin/stream/source?lens=1", token=token
+        )
+        assert code == 200 and json.loads(payload)["stream_url"].endswith("&lens=1")
+        code, _, payload = request(
+            server, "GET", "/api/cameras/cabin/stream/source", token=token
+        )
+        assert "lens=" not in json.loads(payload)["stream_url"]
+
+        for bad in ("x", "-1", "12"):
+            code, _, _ = request(
+                server, "GET", f"/api/cameras/cabin/snapshot.jpg?lens={bad}", token=token
+            )
+            assert code == 400, bad
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_guest_tokens_can_view_but_not_change_settings() -> None:
+    session = FakeSession()
+    bridge = CameraBridge(
+        camera_id="cabin",
+        camera_name="Cabin",
+        api_token="safe-api-token-123",
+        session=session,  # type: ignore[arg-type]
+        ffmpeg="/usr/bin/ffmpeg",
+        guest_tokens={"friend": "guest-token-abcdefgh"},
+    )
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0), make_handler(lambda: {}, lambda: {"cabin": bridge})
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        guest = "guest-token-abcdefgh"
+        assert request(server, "GET", "/api/devices", token=guest)[0] == 200
+        assert request(server, "GET", "/api/cameras/cabin/status", token=guest)[0] == 200
+        assert request(server, "GET", "/api/cameras/cabin/snapshot.jpg", token=guest)[0] == 200
+        assert request(server, "GET", "/api/cameras/cabin/stream/source", token=guest)[0] == 200
+        code, _, _ = request(
+            server, "PATCH", "/api/cameras/cabin/config", token=guest,
+            body={"idle_timeout_seconds": 60},
+        )
+        assert code == 401
+        code, _, _ = request(
+            server, "PATCH", "/api/cameras/cabin/config", token="safe-api-token-123",
+            body={"idle_timeout_seconds": 60},
+        )
+        assert code == 200
+        assert request(server, "GET", "/api/devices", token="revoked-token-xyz")[0] == 401
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)

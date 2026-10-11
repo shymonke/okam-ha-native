@@ -4,14 +4,19 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import platform
+import re
+import secrets
 import signal
+import socket
 import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from pathlib import Path
 
 from okam_native.account import AccountDevice, AccountError, Eye4AccountClient
@@ -20,8 +25,10 @@ from okam_native.p2p import (
     P2PError,
     diagnostic_line,
     get_service_parameter,
+    is_vp_account_record,
     open_stream_process,
     resolve_client_id,
+    resolve_vp_device,
     run_authentication_probe,
     run_connect_probe,
     run_snapshot_probe,
@@ -29,6 +36,12 @@ from okam_native.p2p import (
     select_camera_password,
 )
 from okam_native.session import NativeStreamSession
+from okam_native.vp_credentials import (
+    build_worker_inputs,
+    decrypt_camera_password,
+    select_password_salt,
+)
+from okam_native.vp_helper import open_stream_process as open_vp_stream_process
 from okam_native.wakeup import WakeError, load_wake_credentials, wake_camera
 
 
@@ -47,6 +60,9 @@ CONNECT_HELPER = Path(
 )
 FFMPEG = Path("/usr/bin/ffmpeg")
 LIBRARY = Path("/dev/null") if RUNTIME_ARCH == "amd64" else VENDOR / "libOKSMARTPPCS.so"
+# VP records that carry a checksum need a salt from the SDK library, selected
+# by validating the record. It is present on aarch64; observed records omit it.
+SDK_LIBRARY = VENDOR / "libOKSMARTPPCS.so"
 STATUS: dict[str, object] = {
     "service": "okam-native-bridge",
     "loader_ready": False,
@@ -64,7 +80,27 @@ STATUS: dict[str, object] = {
     "phase": "starting",
 }
 LOCK = threading.Lock()
-BRIDGE: CameraBridge | None = None
+BRIDGES: dict[str, CameraBridge] = {}
+# The account identifier and login token from enumeration, used only to
+# authenticate VP camera channels. Never logged or exposed by status.
+ACCOUNT_SESSION: dict[str, str | None] = {}
+ALIASES_FILE = DATA / "camera_aliases.json"
+# Lens counts learned from framed streams, so every lens of a multi-lens
+# camera is offered again after a restart without waking the camera first.
+LENSES_FILE = DATA / "camera_lenses.json"
+CONFIGURATION_NOTICE = "okam_native_configuration"
+# The VP camera-password key: found once by scanning the official PC client
+# the user places in the app's config folder, then kept privately here.
+SALT_FILE = DATA / "vp_password_salt"
+CLIENT_DIR = Path("/config")
+CLIENT_NAME = "superipcam.exe"
+# Missing-setting phases are shared configuration states, not camera failures.
+CONFIGURATION_PHASES = {"api_token_required", "account_required", "vp_password_salt_required"}
+# Generated when the api_token option is blank, so first-time users never have
+# to invent a secret; the integration receives it through Supervisor discovery.
+TOKEN_FILE = DATA / "api_token"
+SUPERVISOR = "http://supervisor"
+BRIDGE_PORT = 8099
 
 
 def set_status(**values: object) -> None:
@@ -75,8 +111,14 @@ def set_status(**values: object) -> None:
 def get_status() -> dict[str, object]:
     with LOCK:
         payload = dict(STATUS)
-        bridge = BRIDGE
-    if bridge is not None:
+        bridges = dict(BRIDGES)
+    payload["camera_count"] = len(bridges)
+    if bridges:
+        active = next(
+            (item for item in bridges.values() if item.session.status().running),
+            None,
+        )
+        bridge = active or next(iter(bridges.values()))
         session = bridge.session.status()
         payload.update(
             stream_running=session.running,
@@ -96,9 +138,9 @@ def get_status() -> dict[str, object]:
     return payload
 
 
-def get_bridge() -> CameraBridge | None:
+def get_bridges() -> dict[str, CameraBridge]:
     with LOCK:
-        return BRIDGE
+        return dict(BRIDGES)
 
 
 def load_vendor_runtime() -> None:
@@ -169,32 +211,351 @@ def load_options() -> dict[str, object]:
     return value
 
 
-def enumerate_account() -> AccountDevice | None:
+def load_lens_counts() -> dict[str, int]:
+    try:
+        saved = json.loads(LENSES_FILE.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(saved, dict):
+        return {}
+    return {
+        alias: count
+        for alias, count in saved.items()
+        if isinstance(alias, str) and type(count) is int and 1 <= count <= 4
+    }
+
+
+def save_lens_count(alias: str, count: int) -> None:
+    counts = load_lens_counts()
+    if counts.get(alias) == count:
+        return
+    counts[alias] = count
+    try:
+        LENSES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temporary = LENSES_FILE.with_suffix(".tmp")
+        temporary.write_text(json.dumps(counts, sort_keys=True), encoding="utf-8")
+        temporary.replace(LENSES_FILE)
+    except OSError:
+        return
+    print(f"camera_lenses={count}", flush=True)
+
+
+def _salt_decodes(salt: str, records: list[tuple[str, str]]) -> bool:
+    try:
+        for security, double_check in records:
+            decrypt_camera_password(security, double_check, salt)
+    except P2PError:
+        return False
+    return True
+
+
+def find_client() -> Path | None:
+    try:
+        return next(
+            (item for item in CLIENT_DIR.iterdir() if item.name.lower() == CLIENT_NAME),
+            None,
+        )
+    except OSError:
+        return None
+
+
+def resolve_vp_password_salt(
+    options: dict[str, object], records: list[tuple[str, str]]
+) -> str | None:
+    """The configured key, else the saved one, else one found in the client."""
+
+    configured = options.get("vp_password_salt")
+    if isinstance(configured, str) and configured:
+        return configured
+    try:
+        saved = SALT_FILE.read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError):
+        saved = ""
+    if saved and _salt_decodes(saved, records):
+        return saved
+    client = find_client()
+    if client is None:
+        return None
+    set_status(phase="finding_vp_password_key")
+    print("vp_password_key_search=started", flush=True)
+    try:
+        salt = select_password_salt(client.read_bytes(), records)
+    except (OSError, P2PError) as error:
+        reason = "not_found" if isinstance(error, P2PError) else "unreadable"
+        print(f"vp_password_key_search=failed reason={reason}", flush=True)
+        return None
+    partial = SALT_FILE.with_suffix(".tmp")
+    descriptor = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w", encoding="ascii") as handle:
+        handle.write(salt)
+    os.replace(partial, SALT_FILE)
+    print("vp_password_key_search=found", flush=True)
+    return salt
+
+
+GUEST_NAME = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+
+
+def resolve_guest_tokens(options: dict[str, object]) -> dict[str, str]:
+    """Named read-only tokens; blank ones are generated and shown in options.
+
+    Each entry of the ``guest_tokens`` option names one person or program.
+    Deleting an entry and restarting revokes it. Only names are logged.
+    """
+
+    entries = options.get("guest_tokens")
+    if not isinstance(entries, list):
+        return {}
+    tokens: dict[str, str] = {}
+    updated: list[object] = []
+    generated: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        token = entry.get("token")
+        if not isinstance(name, str) or not GUEST_NAME.fullmatch(name) or name in tokens:
+            print("guest_token_ignored=true reason=invalid_or_duplicate_name", flush=True)
+            continue
+        if token in (None, ""):
+            token = secrets.token_urlsafe(32)
+            generated.append(name)
+        if not _valid_token(token):
+            print(f"guest_token_ignored=true name={name} reason=too_short", flush=True)
+            continue
+        tokens[name] = token
+        updated.append({**entry, "token": token})
+    if generated:
+        print(f"guest_tokens_generated={','.join(generated)}", flush=True)
+        if os.environ.get("SUPERVISOR_TOKEN"):
+            try:
+                save_options(options, {"guest_tokens": updated})
+            except (OSError, ValueError, KeyError):
+                print("guest_tokens_saved_to_configuration=false", flush=True)
+    if tokens:
+        print(f"guest_tokens_active={','.join(sorted(tokens))}", flush=True)
+    return tokens
+
+
+def _valid_token(value: object) -> bool:
+    return isinstance(value, str) and 16 <= len(value) <= 1024
+
+
+def resolve_api_token(options: dict[str, object]) -> str | None:
+    """Return the configured token, or a persisted generated one when blank."""
+
+    configured = options.get("api_token")
+    if configured not in (None, ""):
+        return configured if _valid_token(configured) else None
+    try:
+        stored = TOKEN_FILE.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        stored = ""
+    if _valid_token(stored):
+        # Tokens generated before the field was filled in are shown now too.
+        store_token_in_options(options, stored)
+        return stored
+    token = secrets.token_urlsafe(32)
+    partial = TOKEN_FILE.with_suffix(".tmp")
+    descriptor = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(token)
+    os.replace(partial, TOKEN_FILE)
+    print("api_token_generated=true", flush=True)
+    store_token_in_options(options, token)
+    return token
+
+
+# Changes this run has saved to the app options. Supervisor does not rewrite
+# options.json until the next start, so each save re-applies earlier ones.
+_OPTION_CHANGES: dict[str, object] = {}
+
+
+def save_options(options: dict[str, object], changes: dict[str, object]) -> None:
+    _OPTION_CHANGES.update(changes)
+    _supervisor_request("/addons/self/options", {"options": {**options, **_OPTION_CHANGES}})
+
+
+def store_token_in_options(options: dict[str, object], token: str) -> bool:
+    """Show the generated token in the app's own Configuration tab.
+
+    The option is a password field, so it stays masked and visible only to
+    Home Assistant administrators; nothing is printed to the log.
+    """
+
+    if not os.environ.get("SUPERVISOR_TOKEN"):
+        return False
+    try:
+        save_options(options, {"api_token": token})
+    except (OSError, ValueError, KeyError):
+        print("api_token_saved_to_configuration=false", flush=True)
+        return False
+    print("api_token_saved_to_configuration=true", flush=True)
+    return True
+
+
+def notify(message: str | None) -> None:
+    """Show (or, with None, dismiss) the setup notice in Home Assistant."""
+
+    if not os.environ.get("SUPERVISOR_TOKEN"):
+        return
+    service = "create" if message else "dismiss"
+    payload: dict[str, object] = {"notification_id": CONFIGURATION_NOTICE}
+    if message:
+        payload.update(title="O-KAM Native Bridge needs setup", message=message)
+    try:
+        _supervisor_request(
+            f"/core/api/services/persistent_notification/{service}", payload
+        )
+    except (OSError, ValueError, KeyError):
+        pass
+
+
+def report_missing(names: list[str], phase: str) -> None:
+    """Name missing settings in the log, status and a notification, never values."""
+
+    joined = ",".join(names)
+    set_status(configuration_required=True, phase=phase, missing_options=names)
+    print(
+        f"configuration_required={joined} "
+        "action=open_the_app_Configuration_tab_and_fill_these_in",
+        flush=True,
+    )
+    labels = {
+        "account_username": "O-KAM account email",
+        "account_password": "O-KAM account password",
+        "vp_password_salt": (
+            "VP camera password key (or put the O-KAM PC client SuperIPCam.exe "
+            "in the app's config folder so it is found automatically)"
+        ),
+    }
+    readable = ", ".join(labels.get(name, name) for name in names)
+    notify(
+        f"Open **Settings → Apps → O-KAM Native Bridge → Configuration** and fill in: "
+        f"{readable}. Then save and restart the app."
+    )
+
+
+def _supervisor_request(path: str, payload: dict[str, object] | None = None) -> dict:
+    request = urllib.request.Request(
+        SUPERVISOR + path,
+        data=None if payload is None else json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {os.environ['SUPERVISOR_TOKEN']}",
+            "Content-Type": "application/json",
+        },
+        method="GET" if payload is None else "POST",
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        body = json.loads(response.read().decode("utf-8") or "{}")
+    data = body.get("data") if isinstance(body, dict) else None
+    return data if isinstance(data, dict) else {}
+
+
+def publish_discovery(api_token: str) -> bool:
+    """Announce the bridge so Home Assistant offers the integration itself."""
+
+    if not os.environ.get("SUPERVISOR_TOKEN"):
+        return False
+    try:
+        hostname = _supervisor_request("/addons/self/info").get("hostname")
+        if not isinstance(hostname, str) or not hostname:
+            hostname = socket.gethostname()
+        _supervisor_request(
+            "/discovery",
+            {
+                "service": "okam",
+                "config": {"host": hostname, "port": BRIDGE_PORT, "api_token": api_token},
+            },
+        )
+    except (OSError, ValueError, KeyError):
+        print("discovery_published=false", flush=True)
+        return False
+    print("discovery_published=true", flush=True)
+    return True
+
+
+def enumerate_account() -> list[AccountDevice] | None:
     options = load_options()
     username = options.get("account_username")
     password = options.get("account_password")
-    alias = options.get("camera_id") or "cabin"
-    if not isinstance(username, str) or not username or not isinstance(password, str) or not password:
-        set_status(configuration_required=True)
+    missing = [
+        name
+        for name, value in (("account_username", username), ("account_password", password))
+        if not isinstance(value, str) or not value
+    ]
+    if missing:
+        report_missing(missing, "account_required")
         return None
-    if not isinstance(alias, str):
-        raise RuntimeError("camera alias is invalid")
     set_status(phase="enumerating_account", configuration_required=False)
+    client = Eye4AccountClient()
     try:
-        devices = Eye4AccountClient().enumerate(username, password)
+        devices = client.enumerate(username, password)
     finally:
         username = ""
         password = ""
-    if len(devices) != 1:
-        raise AccountError("O-KAM account must expose exactly one camera")
+    with LOCK:
+        ACCOUNT_SESSION.update(user_id=client.user_id, token=client.login_token)
+    if not devices:
+        raise AccountError("O-KAM account exposes no cameras")
     set_status(
         account_ready=True,
-        device_count=1,
-        camera_alias=alias,
+        device_count=len(devices),
         phase="account_enumerated",
     )
-    print("account_enumerated=true device_count=1", flush=True)
-    return devices[0]
+    print(f"account_enumerated=true device_count={len(devices)}", flush=True)
+    return devices
+
+
+def _camera_alias(name: str) -> str:
+    """A Home Assistant safe alias derived from a camera name."""
+
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "-", name).strip("-").lower()
+    return (slug or "camera")[:32]
+
+
+def camera_aliases(devices: list[AccountDevice]) -> list[str]:
+    """Keep aliases stable across account reorderings and camera renames.
+
+    A lone camera keeps the configured alias so existing installations and
+    their entity identifiers do not change. Multiple cameras derive aliases
+    from the device names and are disambiguated on collision.
+    """
+
+    options = load_options()
+    configured = options.get("camera_id")
+    if len(devices) == 1 and isinstance(configured, str) and configured:
+        return [configured]
+    try:
+        saved = json.loads(ALIASES_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        saved = {}
+    if not isinstance(saved, dict) or any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in saved.items()
+    ):
+        raise RuntimeError("camera alias state is invalid")
+    aliases: list[str] = []
+    used: set[str] = set(saved.values())
+    for device in devices:
+        key = hashlib.sha256(device.uid.encode("utf-8")).hexdigest()
+        if key in saved:
+            aliases.append(saved[key])
+            continue
+        base = _camera_alias(device.name)
+        alias = base
+        suffix = 2
+        while alias in used:
+            alias = f"{base[:28]}-{suffix}"
+            suffix += 1
+        used.add(alias)
+        saved[key] = alias
+        aliases.append(alias)
+    ALIASES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temporary = ALIASES_FILE.with_suffix(".tmp")
+    temporary.write_text(json.dumps(saved, sort_keys=True), encoding="utf-8")
+    temporary.replace(ALIASES_FILE)
+    return aliases
 
 
 def p2p_environment() -> dict[str, str]:
@@ -381,30 +742,96 @@ def run_p2p_acceptance(device: AccountDevice) -> None:
     raise P2PError("camera did not establish a native P2P session")
 
 
-def configure_bridge(device: AccountDevice) -> CameraBridge | None:
-    """Prepare the long-lived, on-demand runtime without waking the camera."""
+def is_vp_device(device: AccountDevice) -> bool:
+    return is_vp_account_record(device_password=device.device_password, security=device.security)
 
-    global BRIDGE
+
+def vp_stream_launcher(device: AccountDevice, options: dict[str, object]):
+    """Derive the VP worker inputs once; the returned callable starts a worker."""
+
+    with LOCK:
+        user_id = ACCOUNT_SESSION.get("user_id")
+        token = ACCOUNT_SESSION.get("token")
+    if not isinstance(user_id, str) or not isinstance(token, str):
+        raise P2PError("VP account session is unavailable")
+    password_salt = resolve_vp_password_salt(options, [(device.security or "", user_id)])
+    if password_salt is None:
+        report_missing(["vp_password_salt"], "vp_password_salt_required")
+        raise P2PError("VP camera password salt is not configured")
+    connection = resolve_vp_device(device.uid).native_connection_input()
+    try:
+        library = SDK_LIBRARY.read_bytes() if SDK_LIBRARY.is_file() else b""
+    except OSError:
+        library = b""
+    inputs = build_worker_inputs(
+        connection=connection, user_id=user_id, token=token, security=device.security or "",
+        password_salt=password_salt, library=library,
+    )
+
+    def launch() -> subprocess.Popen[bytes]:
+        environment = os.environ.copy()
+        # The worker runs as a module; the package sits beside this script.
+        environment["PYTHONPATH"] = os.pathsep.join(
+            item for item in (str(Path(__file__).resolve().parent), environment.get("PYTHONPATH")) if item
+        )
+        # Framed output carries every lens of a multi-lens camera in one
+        # connection; the session splits it per lens.
+        return open_vp_stream_process(
+            inputs.worker_config(framed=True), environment=environment
+        )
+
+    return launch
+
+
+_GUEST_TOKENS: dict[str, str] | None = None
+
+
+def guest_tokens() -> dict[str, str]:
+    # Resolved once per start, so tokens are generated and saved only once.
+    global _GUEST_TOKENS
+    if _GUEST_TOKENS is None:
+        _GUEST_TOKENS = resolve_guest_tokens(load_options())
+    return _GUEST_TOKENS
+
+
+def configure_bridge(device: AccountDevice, alias: str) -> CameraBridge | None:
+    """Prepare one long-lived, on-demand runtime without waking the camera."""
+
     options = load_options()
-    api_token = options.get("api_token")
-    alias = options.get("camera_id") or "cabin"
+    api_token = resolve_api_token(options)
     idle_timeout = options.get("idle_timeout_seconds", 120)
+    always_on = options.get("always_on", False)
     camera_password = select_camera_password(
         device.device_password, options.get("camera_password")
     )
-    if not isinstance(api_token, str) or not 16 <= len(api_token) <= 1024:
+    if api_token is None:
         set_status(configuration_required=True, camera_ready=False, phase="api_token_required")
         print("bridge_ready=false configuration_required=api_token", flush=True)
         return None
-    if not isinstance(alias, str):
+    if not isinstance(alias, str) or not alias:
         raise RuntimeError("camera alias is invalid")
     if not isinstance(idle_timeout, int) or not 10 <= idle_timeout <= 600:
         raise RuntimeError("idle timeout is invalid")
+    if not isinstance(always_on, bool):
+        raise RuntimeError("always-on option is invalid")
     credentials = load_wake_credentials(VENDOR / "device_wakeup_server.dart")
     if credentials is None:
         raise WakeError("official wake configuration was unavailable")
-    client_id = resolve_client_id(device.uid)
-    service_parameter = get_service_parameter(client_id)
+    if is_vp_device(device):
+        launch = vp_stream_launcher(device, options)
+    else:
+        client_id = resolve_client_id(device.uid)
+        service_parameter = get_service_parameter(client_id)
+
+        def launch() -> subprocess.Popen[bytes]:
+            return open_stream_process(
+                str(CONNECT_HELPER),
+                str(LIBRARY),
+                client_id,
+                service_parameter,
+                camera_password,
+                environment=p2p_environment(),
+            )
 
     def start_stream() -> subprocess.Popen[bytes]:
         set_status(phase="waking_camera_on_demand")
@@ -417,38 +844,97 @@ def configure_bridge(device: AccountDevice) -> CameraBridge | None:
             )
         except WakeError:
             set_status(phase="starting_native_stream")
-        return open_stream_process(
-            str(CONNECT_HELPER),
-            str(LIBRARY),
-            client_id,
-            service_parameter,
-            camera_password,
-            environment=p2p_environment(),
-        )
+        return launch()
 
-    session = NativeStreamSession(start_stream, idle_timeout=float(idle_timeout))
+    vp = is_vp_device(device)
+    session = NativeStreamSession(
+        start_stream,
+        idle_timeout=float(idle_timeout),
+        always_on=always_on,
+        framed=vp,
+        lenses=load_lens_counts().get(alias, 1) if vp else 1,
+        on_lenses=lambda count: save_lens_count(alias, count),
+    )
     bridge = CameraBridge(
         camera_id=alias,
         camera_name=device.name,
         api_token=api_token,
         session=session,
         ffmpeg=str(FFMPEG),
+        guest_tokens=guest_tokens(),
     )
     with LOCK:
-        BRIDGE = bridge
+        BRIDGES[alias] = bridge
+        camera_count = len(BRIDGES)
     set_status(
         camera_ready=True,
         configuration_required=False,
         phase="bridge_ready",
         idle_timeout_seconds=idle_timeout,
+        always_on=always_on,
+        camera_count=camera_count,
     )
-    print("bridge_ready=true camera_count=1", flush=True)
+    print(f"bridge_ready=true camera_count={camera_count}", flush=True)
+    if always_on:
+        # The first start wakes the camera; keep it off the configuration path
+        # so one slow camera does not delay the others.
+        threading.Thread(target=session.start_always_on, daemon=True).start()
     return bridge
+
+
+def configure_cameras(devices: list[AccountDevice]) -> tuple[int, int]:
+    """Configure each camera independently and report ready/failed counts.
+
+    An expected per-camera failure (resolution, service lookup, acceptance) is
+    contained to that camera so the remaining cameras still start. Account,
+    loader, and shared-configuration failures are not caught here and stay
+    global. Programming errors are deliberately not swallowed either.
+    """
+
+    options = load_options()
+    # Validate the shared camera-password option once. An invalid global value
+    # must fail globally rather than be swallowed as a per-camera error.
+    configured_password = options.get("camera_password")
+    if configured_password not in (None, ""):
+        select_camera_password("", configured_password)
+
+    aliases = camera_aliases(devices)
+    ready = 0
+    failed = 0
+    for device, alias in zip(devices, aliases, strict=True):
+        try:
+            # The bounded acceptance probes exercise the CS2 transport only.
+            if not is_vp_device(device):
+                run_p2p_acceptance(device)
+            bridge = configure_bridge(device, alias)
+        except P2PError:
+            failed += 1
+            set_status(camera_failed_count=failed)
+            print(
+                f"camera_setup_failed=true reason=P2PError ready={ready} failed={failed}",
+                flush=True,
+            )
+            continue
+        if bridge is None:
+            failed += 1
+        else:
+            ready += 1
+    set_status(camera_ready_count=ready, camera_failed_count=failed)
+    if ready > 0:
+        # A later camera's acceptance failure can leave the phase mid-connect;
+        # restore the ready phase so the global state matches reality.
+        set_status(phase="bridge_ready")
+    # A missing API token is a shared configuration state reported by
+    # configure_bridge, not a camera failure, so it must not be overwritten.
+    if ready == 0 and STATUS.get("phase") not in CONFIGURATION_PHASES:
+        set_status(camera_ready=False, phase="no_camera_ready")
+        print(f"no_camera_ready=true failed={failed}", flush=True)
+    return ready, failed
 
 
 def main() -> int:
     server = QuietThreadingHTTPServer(
-        ("0.0.0.0", 8099), make_handler(get_status, get_bridge)
+        ("0.0.0.0", BRIDGE_PORT), make_handler(get_status, get_bridges)
     )
     threading.Thread(target=server.serve_forever, daemon=True).start()
     stop = threading.Event()
@@ -460,10 +946,13 @@ def main() -> int:
     signal.signal(signal.SIGINT, request_stop)
     try:
         load_vendor_runtime()
-        device = enumerate_account()
-        if device is not None:
-            run_p2p_acceptance(device)
-            configure_bridge(device)
+        devices = enumerate_account()
+        if devices is not None:
+            ready, _failed = configure_cameras(devices)
+            api_token = resolve_api_token(load_options())
+            if ready > 0 and api_token is not None:
+                notify(None)
+                publish_discovery(api_token)
     except Exception as error:
         phase = "startup_error" if STATUS["loader_ready"] else "native_loader_error"
         detail = str(error).replace(" ", "_") if isinstance(error, P2PError) else None
@@ -471,8 +960,7 @@ def main() -> int:
         suffix = f" detail={detail}" if detail else ""
         print(f"startup_ready=false error={type(error).__name__}{suffix}", flush=True)
     stop.wait()
-    bridge = get_bridge()
-    if bridge is not None:
+    for bridge in get_bridges().values():
         bridge.session.close()
     server.shutdown()
     server.server_close()

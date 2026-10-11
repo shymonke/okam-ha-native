@@ -4,10 +4,6 @@ O-KAM Native Bridge is composed of a Home Assistant app and a custom
 integration. Both are distributed from this repository, support `aarch64` and
 `amd64`, and use matching release versions.
 
-The bridge is designed for exactly one O-KAM Pro (CS2) camera per account.
-VP-series cameras may enumerate through the account service but cannot stream,
-and PTZ / IR control is not implemented.
-
 ## Data flow
 
 ```text
@@ -30,6 +26,19 @@ or waking, it supplies a generated state image without opening a camera
 connection. Opening live view asks the app for a live source and wakes the
 camera. Once media is flowing, still-image requests attach to the existing
 session and produce a real snapshot.
+
+## Multiple cameras
+
+The app enumerates every camera on the account and builds one `CameraBridge` per
+camera, each with its own native session, idle timer, and stream token. The
+registry is keyed by a per-camera alias, and every camera route is namespaced as
+`/api/cameras/<alias>/...`, so a request is always served by the camera it names.
+`/api/devices` lists the aliases the registry holds. The Home Assistant
+integration creates one entity per configured camera, so adding the integration
+once per camera produces several entities against one bridge.
+
+A lone camera keeps the alias configured in the app, so a single-camera
+installation is unchanged.
 
 ## Camera lifecycle
 
@@ -69,7 +78,7 @@ muxer, and required filters used to create snapshots.
 - Camera wake and P2P traffic are outbound from the app.
 - TCP port 8099 exposes the bridge API on the local Home Assistant host.
 - Camera API routes require the user-created bearer token.
-- The raw stream uses a separate random token generated at each app start.
+- Each camera's raw stream uses its own random token, generated at each app start.
 - `/health` and `/ready` are intentionally unauthenticated and contain no
   credentials, vendor camera identifiers, or account tokens.
 

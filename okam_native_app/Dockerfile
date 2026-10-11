@@ -94,7 +94,7 @@ RUN cd "/tmp/FFmpeg-n${FFMPEG_VERSION}" \
     && cp ffmpeg /out/ffmpeg/bin/ffmpeg
 
 FROM python:3.12-slim-bookworm AS runtime-base
-ARG BUILD_VERSION=0.1.0-preview1
+ARG BUILD_VERSION=1.2.1
 ARG BUILD_ARCH
 LABEL io.hass.version=$BUILD_VERSION \
       io.hass.arch=$BUILD_ARCH \
@@ -104,6 +104,8 @@ LABEL io.hass.version=$BUILD_VERSION \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
+# VP cameras use the pure-Python transport, which needs AES.
+RUN pip install --no-cache-dir "cryptography>=44,<47"
 
 COPY --from=ffmpeg-build /out/ffmpeg/bin/ffmpeg /usr/bin/ffmpeg
 COPY tools/fetch_official_sdk.py /opt/okam/tools/fetch_official_sdk.py

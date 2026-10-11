@@ -10,6 +10,8 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from .p2p import valid_vp_security
+
 
 ACCOUNT_ORIGIN = "https://api.eye4.cn"
 MAX_RESPONSE_BYTES = 1024 * 1024
@@ -22,11 +24,18 @@ class AccountError(RuntimeError):
 
 @dataclass(frozen=True, repr=False)
 class AccountDevice:
-    """An O-KAM camera record whose sensitive values are excluded from repr."""
+    """An O-KAM camera record whose sensitive values are excluded from repr.
+
+    ``security`` carries the documented VP account field only when it is a
+    well-formed 32-character visible-printable-ASCII value; a missing or
+    malformed value is stored as ``None`` so the record fails closed to the
+    legacy path.
+    """
 
     uid: str = field(repr=False)
     name: str
     device_password: str = field(repr=False)
+    security: str | None = field(default=None, repr=False)
 
 
 OpenRequest = Callable[[urllib.request.Request, float], bytes]
@@ -47,6 +56,10 @@ class Eye4AccountClient:
 
     def __init__(self, *, opener: OpenRequest = _open_request) -> None:
         self._opener = opener
+        # Set by enumerate(); VP cameras authenticate the camera channel with
+        # the account identifier and this session's login token.
+        self.user_id: str | None = None
+        self.login_token: str | None = None
 
     def _request_json(
         self,
@@ -72,7 +85,7 @@ class Eye4AccountClient:
                 "Accept": "application/json",
                 "client_version": "10.0.1",
                 "Content-Type": "application/x-www-form-urlencoded",
-                "User-Agent": "okam-ha-native/account-enumerator",
+                "User-Agent": "okam-native/account-enumerator",
             },
         )
         try:
@@ -108,6 +121,8 @@ class Eye4AccountClient:
         )
         if not isinstance(login, dict) or not isinstance(login.get("token"), str):
             raise AccountError("O-KAM account credentials were rejected")
+        self.user_id = str(user_id)
+        self.login_token = login["token"]
 
         devices = self._request_json(
             "GET",
@@ -125,11 +140,15 @@ class Eye4AccountClient:
                 continue
             name = item.get("nickname")
             device_password = item.get("password")
+            security_value = item.get("security")
             result.append(
                 AccountDevice(
                     uid=uid,
                     name=name if isinstance(name, str) and name else "O-KAM camera",
                     device_password=device_password if isinstance(device_password, str) else "",
+                    # Carry the VP security field only when it is well formed;
+                    # anything else fails closed to None.
+                    security=security_value if valid_vp_security(security_value) else None,
                 )
             )
         return result

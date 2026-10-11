@@ -6,6 +6,7 @@ __pycache__/
 .pytest-*/
 .tmp-pytest/
 .testdeps/
+.codex-testdeps/
 .coverage
 build/
 dist/
@@ -26,3 +27,8 @@ probe-*.log
 *.exe
 uv.lock
 *.egg-info/
+
+# Local captures and recordings
+captures/
+okam-captures/
+.scratch/

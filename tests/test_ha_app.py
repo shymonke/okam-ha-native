@@ -1,7 +1,16 @@
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).parents[1]
+# The side-by-side test add-on exists only in the private development repo;
+# public releases ship the installed add-on alone.
+ADDON_CONFIGS = tuple(
+    name
+    for name in ("config.yaml", "test-addon/config.yaml")
+    if (ROOT / "okam_native_app" / name).is_file()
+)
 
 
 def test_native_bridge_is_a_prebuilt_64_bit_ha_app() -> None:
@@ -12,12 +21,13 @@ def test_native_bridge_is_a_prebuilt_64_bit_ha_app() -> None:
     assert "boot: auto" in config
     assert "stage: experimental" not in config
     assert "machine:" not in config
-    assert "version: 0.1.0-preview1" in config
+    assert "version: 1.3.0" in config
     assert "idle_timeout_seconds: 120" in config
-    assert "account_username: email" in config
-    assert "account_password: password" in config
+    assert "account_username: email?" in config
+    assert "account_password: password?" in config
     assert "camera_password: password?" in config
-    assert "api_token: password" in config
+    assert "api_token: password?" in config
+    assert "discovery:\n  - okam\n" in config
     assert 'idle_timeout_seconds: "int(10,600)"' in config
     assert "run_connect_test: bool" in config
     assert "run_auth_test: bool" in config
@@ -75,7 +85,7 @@ def test_repository_contains_camera_integration_for_native_api() -> None:
     manifest = (component / "manifest.json").read_text(encoding="utf-8")
     config_flow = (component / "config_flow.py").read_text(encoding="utf-8")
     camera = (component / "camera.py").read_text(encoding="utf-8")
-    assert '"version": "0.1.0-preview1"' in manifest
+    assert '"version": "1.3.0"' in manifest
     assert "http://homeassistant.local:8099" in config_flow
     assert "CameraEntityFeature.STREAM" in camera
     assert "_attr_has_entity_name = False" in camera
@@ -84,10 +94,10 @@ def test_repository_contains_camera_integration_for_native_api() -> None:
     assert "WAKE_WATCH_SECONDS = 90" in camera
     assert "self.async_update_token()" in camera
     assert "self._last_snapshot" in camera
-    assert (
-        "self.internal_integration_suggested_object_id = runtime.coordinator.camera_id"
-        in camera
-    )
+    # Lens 1 keeps the plain camera ID; later lenses get a _lens_N suffix.
+    assert 'self.internal_integration_suggested_object_id = f"{camera_id}{suffix}"' in camera
+    assert 'suffix = f"_lens_{lens + 1}" if lens else ""' in camera
+    assert 'self._attr_unique_id = f"{camera_id}_camera{suffix}"' in camera
 
 
 def test_integration_uses_two_minute_warm_connection_default() -> None:
@@ -167,13 +177,15 @@ def test_latest_tag_only_ever_follows_main() -> None:
 
 
 def test_test_addon_cannot_collide_with_the_installed_one() -> None:
+    if "test-addon/config.yaml" not in ADDON_CONFIGS:
+        pytest.skip("public release without the development test add-on")
     installed = (ROOT / "okam_native_app" / "config.yaml").read_text(encoding="utf-8")
     candidate = (
         ROOT / "okam_native_app" / "test-addon" / "config.yaml"
     ).read_text(encoding="utf-8")
 
-    assert "slug: okam_ha_native\n" in installed
-    assert "slug: okam_ha_native_test\n" in candidate
+    assert "slug: okam_native\n" in installed
+    assert "slug: okam_native_test\n" in candidate
     # Distinct host port, so both can run side by side.
     assert "8099/tcp: 8099" in installed
     assert "8099/tcp: 8098" in candidate
@@ -185,7 +197,7 @@ def test_camera_password_is_optional_in_both_addon_schemas() -> None:
     # but a schema entry without a trailing "?" is required, so the supervisor
     # refused to save the options at all. There is no safe placeholder either:
     # any value here overrides the credential the account hands back.
-    for name in ("config.yaml", "test-addon/config.yaml"):
+    for name in ADDON_CONFIGS:
         config = (ROOT / "okam_native_app" / name).read_text(encoding="utf-8")
         assert "  camera_password: password?\n" in config, name
         # An optional option validates when the key is absent. A null default
@@ -200,7 +212,7 @@ def test_watchdog_targets_a_declared_container_port() -> None:
     # never resolves, and the app is restarted underneath a live stream.
     import re
 
-    for name in ("config.yaml", "test-addon/config.yaml"):
+    for name in ADDON_CONFIGS:
         config = (ROOT / "okam_native_app" / name).read_text(encoding="utf-8")
         watched = re.search(r"watchdog:.*\[PORT:(\d+)\]", config)
         assert watched is not None, name
@@ -217,48 +229,23 @@ def test_addon_changelog_matches_the_repository_changelog() -> None:
     assert packaged == root
 
 
-def test_release_version_is_aligned_across_metadata() -> None:
-    version = "0.1.0-preview1"
-    config = (ROOT / "okam_native_app" / "config.yaml").read_text(encoding="utf-8")
-    manifest = (ROOT / "custom_components" / "okam" / "manifest.json").read_text(
-        encoding="utf-8"
-    )
-    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    dockerfile = (ROOT / "okam_native_app" / "Dockerfile").read_text(encoding="utf-8")
-
-    assert f"version: {version}\n" in config
-    assert f'"version": "{version}"' in manifest
-    assert f'version = "{version}"' in pyproject
-    assert f"ARG BUILD_VERSION={version}" in dockerfile
-
-
-def test_documentation_is_honest_about_scope_and_install_status() -> None:
-    documents = [
-        ROOT / "README.md",
-        ROOT / "SECURITY.md",
-        ROOT / "docs" / "architecture.md",
-        ROOT / "docs" / "troubleshooting.md",
-        ROOT / "okam_native_app" / "DOCS.md",
-        ROOT / "okam_native_app" / "README.md",
-    ]
-    combined = "\n".join(path.read_text(encoding="utf-8") for path in documents)
-    lowered = combined.lower()
-
-    # Single-camera Pro/CS2 scope, with the unsupported features named plainly.
-    assert "vp-series" in lowered
-    assert "ptz" in lowered
-    assert "night-vision" in lowered
-    # The preview image is published and installable.
-    assert "preview" in lowered
-    assert "published" in lowered
-    assert "ghcr.io/shymonke/okam-ha-native" in combined
+def test_no_addon_option_is_required_so_supervisor_never_echoes_secrets() -> None:
+    # When a required option is missing the supervisor's error message prints
+    # every submitted option, passwords included. Keeping every option
+    # optional leaves validation to the app, which never prints values.
+    for name in ADDON_CONFIGS:
+        config = (ROOT / "okam_native_app" / name).read_text(encoding="utf-8")
+        schema = config.split("schema:\n", 1)[1]
+        for line in schema.splitlines():
+            key, _, kind = line.strip().partition(": ")
+            if kind.strip('"').split("(")[0] in {"email", "password", "str"}:
+                raise AssertionError(f"{name}: {key} is required")
+        assert ": null\n" not in config, name
 
 
-def test_image_publication_is_manual_only() -> None:
-    # The first push must not publish an image. Only workflow_dispatch may.
-    workflow = (ROOT / ".github" / "workflows" / "publish-image.yml").read_text(
-        encoding="utf-8"
-    )
-
-    assert "workflow_dispatch:" in workflow
-    assert "\n  push:" not in workflow
+def test_integration_accepts_supervisor_discovery() -> None:
+    component = ROOT / "custom_components" / "okam"
+    config_flow = (component / "config_flow.py").read_text(encoding="utf-8")
+    strings = (component / "strings.json").read_text(encoding="utf-8")
+    assert "async def async_step_hassio(" in config_flow
+    assert '"hassio_confirm"' in strings

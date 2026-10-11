@@ -65,14 +65,14 @@ def test_uid_and_network_address_wire_layouts() -> None:
     assert encode_uid("VSTN123456ABCDE") == (
         b"VSTN\0\0\0\0\x00\x01\xe2@ABCDE\0\0\0"
     )
-    encoded = encode_network_address("192.168.3.60", 0x1234)
-    assert encoded == bytes.fromhex("000234123c03a8c00000000000000000")
-    assert decode_network_address(encoded) == ("192.168.3.60", 0x1234)
+    encoded = encode_network_address("192.0.2.60", 0x1234)
+    assert encoded == bytes.fromhex("000234123c0200c00000000000000000")
+    assert decode_network_address(encoded) == ("192.0.2.60", 0x1234)
 
 
 def test_relay_list_and_packets_match_recovered_wire_layouts() -> None:
     uid = encode_uid("VSTN123456ABCDE")
-    local_address = encode_network_address("192.168.3.60", 0x1234)
+    local_address = encode_network_address("192.0.2.60", 0x1234)
     relay_address = encode_network_address("192.0.2.10", 32100)
     relay_list = b"\xf1\x69\x00\x14\x01\x00\x00\x00" + relay_address
 
@@ -704,3 +704,32 @@ def test_packets_from_a_different_host_are_still_rejected() -> None:
     session._pump()
 
     assert session.counters["packets_from_other_source"] == 1
+
+
+def _cs2_encode_plaintext(plaintext: bytes) -> str:
+    """Invert the CS2 chain cipher so a plaintext list can be round-tripped."""
+
+    encoded: list[str] = []
+    decoded = bytearray()
+    for index, byte in enumerate(plaintext):
+        chained = 57
+        for previous in decoded:
+            chained ^= previous
+        pair = chained ^ _DECODE_LOOKUP[index % len(_DECODE_LOOKUP)] ^ byte
+        encoded.append(chr(ord("A") + (pair >> 4)))
+        encoded.append(chr(ord("A") + (pair & 0x0F)))
+        decoded.append(byte)
+    return "".join(encoded)
+
+
+def test_cs2_decoder_still_rejects_hostname_server_lists() -> None:
+    # The VP hostname-tolerant decoder must not have relaxed the CS2 path: an
+    # encoded hostname list is still rejected there.
+    valid = _cs2_encode_plaintext(b"192.0.2.1,192.0.2.2")
+    servers, key = cs2.decode_service_parameter(valid + ":candidate-key")
+    assert servers == ("192.0.2.1", "192.0.2.2")
+    assert key == "candidate-key"
+
+    hostname = _cs2_encode_plaintext(b"cam.example.com")
+    with pytest.raises(CS2Error):
+        cs2.decode_service_parameter(hostname + ":candidate-key")

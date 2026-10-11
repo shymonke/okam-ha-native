@@ -21,6 +21,27 @@ MAX_FIELD_BYTES = 4096
 VIRTUAL_ID_PATTERN = re.compile(r"^[A-Za-z]+\d{7,}.*[A-Za-z]$")
 DEFAULT_CAMERA_PASSWORD = "888888"
 
+# Newer VP resolver contract.
+# The resolver answers a JSON object for a VP camera with a 17-character ``did``
+# whose last 15 characters match the CS2 transport-ID shape, plus an opaque
+# 164-character ``address`` of the form ``<2 chars>S-<160 chars>`` over a
+# distinct alphabet. VP cameras enumerate with an empty per-camera password and
+# a 32-character ``security`` field. None of this establishes that a VP
+# parameter is accepted on the wire; see the doc.
+VP_SERVICE_DIRECTORY_URL = "https://vuid-vp.eye4.cn/vuid/query"
+VP_DID_LENGTH = 17
+VP_TRANSPORT_ID_LENGTH = 15
+VP_ADDRESS_LENGTH = 164
+VP_ADDRESS_ALPHABET = frozenset("-0123456789ABCDEFS")
+VP_SECURITY_LENGTH = 32
+VP_MAX_SERVERS = 16
+VP_MAX_HOSTNAME_BYTES = 253
+VP_MAX_KEY_BYTES = 128
+VP_HOSTNAME_PATTERN = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$"
+)
+
 
 class P2PError(RuntimeError):
     """A sanitized P2P failure that never contains a device identifier."""
@@ -54,7 +75,7 @@ def get_service_parameter(uid: str, *, opener: OpenRequest = _open_request) -> s
         headers={
             "Accept": "application/json",
             "Content-Type": "application/json; charset=utf-8",
-            "User-Agent": "okam-ha-native/p2p-directory",
+            "User-Agent": "okam-native/p2p-directory",
         },
     )
     try:
@@ -88,7 +109,7 @@ def resolve_client_id(uid: str, *, opener: OpenRequest = _open_request) -> str:
         headers={
             "Accept": "application/json",
             "Content-Type": "application/json; charset=utf-8",
-            "User-Agent": "okam-ha-native/vuid-resolver",
+            "User-Agent": "okam-native/vuid-resolver",
         },
     )
     try:
@@ -102,6 +123,200 @@ def resolve_client_id(uid: str, *, opener: OpenRequest = _open_request) -> str:
     if not isinstance(client_id, str) or not 4 <= len(client_id) <= 256:
         raise P2PError("official virtual-device resolver response was invalid")
     return client_id
+
+
+@dataclass(frozen=True)
+class VpResolution:
+    """The validated shape of one newer-resolver VP response.
+
+    ``transport_id`` retains the historical 15-character suffix. CPPPP2 uses
+    ``native_identity`` in full and the DAS ``address`` record. The native
+    decoder validates that record separately; resolution is not a connection.
+    """
+
+    transport_id: str = field(repr=False)
+    address: str = field(repr=False)
+    # Preserve the complete resolver identity for CPPPP2. The historical
+    # 15-character suffix is not the identity used by its packet builder.
+    native_identity: str | None = field(default=None, repr=False)
+
+    def native_connection_input(self) -> str:
+        """Supply the observed constructor format; never invent a prefix."""
+        if (not isinstance(self.native_identity, str)
+                or not re.fullmatch(r"[A-Z0-9]{4}[0-9]{8}[A-Z]{5}", self.native_identity)
+                or not self.address.startswith("DAS-") or not _valid_vp_address(self.address)):
+            raise P2PError("VP native connection input is unavailable")
+        return self.native_identity + "%%" + self.address
+
+
+def _valid_vp_transport_id(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and value.isascii()
+        and len(value) == VP_TRANSPORT_ID_LENGTH
+        and value[:4].isalnum()
+        and value[4:10].isdigit()
+        and value[10:].isalpha()
+    )
+
+
+def _valid_vp_address(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == VP_ADDRESS_LENGTH
+        and value[2] == "S"
+        and value[3] == "-"
+        and all(character in VP_ADDRESS_ALPHABET for character in value)
+    )
+
+
+def _valid_ipv4(value: str) -> bool:
+    parts = value.split(".")
+    if len(parts) != 4:
+        return False
+    for part in parts:
+        if not part.isdigit() or len(part) > 3:
+            return False
+        if len(part) > 1 and part[0] == "0":
+            return False
+        if int(part) > 255:
+            return False
+    return True
+
+
+def _valid_vp_server(value: str) -> bool:
+    """One server token: a canonical IPv4 address or a DNS hostname.
+
+    All-numeric tokens must be canonical dotted quads, so a shorthand such as
+    ``1.2.3`` is rejected rather than accepted as an address.
+    """
+
+    if not value or len(value) > VP_MAX_HOSTNAME_BYTES:
+        return False
+    if value.replace(".", "").isdigit():
+        return _valid_ipv4(value)
+    return VP_HOSTNAME_PATTERN.fullmatch(value) is not None
+
+
+def valid_vp_security(value: object) -> bool:
+    """Whether a value is a well-formed VP ``security`` field.
+
+    The documented shape is exactly 32 visible-printable ASCII characters
+    (``0x21``-``0x7E``; a space is rejected). This is a shape check only; it
+    says nothing about the field's cryptographic role.
+    """
+
+    return (
+        isinstance(value, str)
+        and value.isascii()
+        and len(value) == VP_SECURITY_LENGTH
+        and all(0x20 < ord(character) < 0x7F for character in value)
+    )
+
+
+def is_vp_account_record(*, device_password: object, security: object) -> bool:
+    """Whether an account record matches the documented VP shape.
+
+    The investigation records that VP cameras enumerate with an empty
+    per-camera password and a 32-character security field. This is a
+    discriminator only: it says nothing about whether the VP wire path works.
+    """
+
+    return device_password == "" and valid_vp_security(security)
+
+
+def resolve_vp_device(uid: str, *, opener: OpenRequest = _open_request) -> VpResolution:
+    """Resolve one VP camera through the newer resolver, or fail closed.
+
+    Only the two documented response fields are read, and only their shapes are
+    validated; a failure never echoes the identifier, a host, the address, the
+    key, or a URL.
+    """
+
+    if not isinstance(uid, str) or not 4 <= len(uid) <= 256:
+        raise P2PError("camera device identifier is invalid")
+    query = urllib.parse.urlencode({"vuid": uid})
+    request = urllib.request.Request(
+        VP_SERVICE_DIRECTORY_URL + "?" + query,
+        method="GET",
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json; charset=utf-8",
+            "User-Agent": "okam-native/vp-resolver",
+        },
+    )
+    try:
+        payload = opener(request, HTTP_TIMEOUT_SECONDS)
+        result = json.loads(payload.decode("utf-8"))
+    except P2PError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError, urllib.error.URLError):
+        raise P2PError("official VP resolver request failed") from None
+    if not isinstance(result, dict):
+        raise P2PError("official VP resolver response was invalid")
+    did = result.get("did")
+    address = result.get("address")
+    if not isinstance(did, str) or len(did) != VP_DID_LENGTH:
+        raise P2PError("official VP resolver response was invalid")
+    transport_id = did[-VP_TRANSPORT_ID_LENGTH:]
+    if not _valid_vp_transport_id(transport_id) or not _valid_vp_address(address):
+        raise P2PError("official VP resolver response was invalid")
+    return VpResolution(transport_id=transport_id, address=address, native_identity=did)
+
+
+def decode_vp_service_parameter(value: str) -> tuple[tuple[str, ...], str]:
+    """Decode a candidate VP service parameter into its server list and key.
+
+    The input is the hypothesized VP counterpart of the CS2 service parameter: a
+    plaintext, comma-separated server list that may contain DNS hostnames (the
+    CS2 decoder accepts only IPv4), followed by ``:`` and a transport key. Every
+    bound is strict, and this function never runs the CS2 chain cipher and never
+    touches the proven CS2 decoder.
+
+    The wire validity of this shape is UNVERIFIED; it exists so a later live gate
+    can test it without weakening the CS2 path.
+    """
+
+    if not isinstance(value, str) or not 0 < len(value) <= MAX_FIELD_BYTES:
+        raise P2PError("VP service parameter is invalid")
+    if value.count(":") != 1:
+        raise P2PError("VP service parameter is invalid")
+    servers_part, key = value.split(":", 1)
+    if not servers_part or len(servers_part) > MAX_FIELD_BYTES:
+        raise P2PError("VP service parameter is invalid")
+    if not key or len(key) > VP_MAX_KEY_BYTES:
+        raise P2PError("VP service parameter is invalid")
+    if not key.isascii() or any(
+        0x21 > ord(character) or ord(character) > 0x7E for character in key
+    ):
+        raise P2PError("VP service parameter is invalid")
+    servers = tuple(servers_part.split(","))
+    if not servers or len(servers) > VP_MAX_SERVERS:
+        raise P2PError("VP service parameter is invalid")
+    for server in servers:
+        if not _valid_vp_server(server):
+            raise P2PError("VP service parameter is invalid")
+    return servers, key
+
+
+def resolve_camera_client_id(
+    uid: str,
+    *,
+    device_password: object,
+    security: object,
+    opener: OpenRequest = _open_request,
+) -> str:
+    """Route one camera record to the VP branch or the legacy resolver.
+
+    A documented VP account record uses the newer resolver; every other record
+    keeps the legacy behavior exactly, so non-VP resolution is unchanged. The VP
+    branch is fail-closed: a malformed resolver response raises rather than
+    falling back to the legacy path.
+    """
+
+    if is_vp_account_record(device_password=device_password, security=security):
+        return resolve_vp_device(uid, opener=opener).transport_id
+    return resolve_client_id(uid, opener=opener)
 
 
 def _field(value: str) -> bytes:

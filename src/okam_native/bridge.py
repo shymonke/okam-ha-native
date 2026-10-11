@@ -11,7 +11,7 @@ import sys
 import threading
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, quote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from .p2p import P2PError
 from .session import NativeStreamSession
@@ -64,28 +64,37 @@ class CameraBridge:
         api_token: str,
         session: NativeStreamSession,
         ffmpeg: str,
+        guest_tokens: dict[str, str] | None = None,
     ) -> None:
         self.camera_id = camera_id
         self.camera_name = camera_name
         self._api_token = api_token
+        # Named read-only tokens for people outside Home Assistant; removing
+        # one from the app options revokes it without touching Home Assistant.
+        self._guest_tokens = dict(guest_tokens or {})
         self._stream_token = secrets.token_urlsafe(32)
         self.session = session
         self.ffmpeg = ffmpeg
 
-    def authenticated(self, authorization: str | None) -> bool:
-        expected = f"Bearer {self._api_token}"
-        return isinstance(authorization, str) and hmac.compare_digest(
-            authorization, expected
-        )
+    def authenticated(self, authorization: str | None, *, write: bool = False) -> bool:
+        """Accept the main token, or a guest token for read-only requests."""
+
+        if not isinstance(authorization, str):
+            return False
+        accepted = [self._api_token] if write else [self._api_token, *self._guest_tokens.values()]
+        # Compare against every candidate so timing does not reveal which matched.
+        results = [hmac.compare_digest(authorization, f"Bearer {token}") for token in accepted]
+        return any(results)
 
     def stream_authenticated(self, token: str | None) -> bool:
         return isinstance(token, str) and hmac.compare_digest(token, self._stream_token)
 
-    def stream_url(self, host: str | None) -> str:
+    def stream_url(self, host: str | None, lens: int = 0) -> str:
         safe_host = host if isinstance(host, str) and HOST_PATTERN.fullmatch(host) else "127.0.0.1:8099"
         camera = quote(self.camera_id, safe="")
         token = quote(self._stream_token, safe="")
-        return f"http://{safe_host}/api/cameras/{camera}/stream.ts?token={token}"
+        suffix = f"&lens={lens}" if lens else ""
+        return f"http://{safe_host}/api/cameras/{camera}/stream.ts?token={token}{suffix}"
 
     def status(self) -> dict[str, object]:
         session = self.session.status()
@@ -101,6 +110,7 @@ class CameraBridge:
             "viewers": session.viewers,
             "media_ready": session.media_ready,
             "idle_timeout_seconds": int(self.session.idle_timeout),
+            "always_on": self.session.always_on,
             "battery_percent": None,
             "signal_dbm": None,
             "last_event": None,
@@ -108,11 +118,34 @@ class CameraBridge:
             "charging": None,
             "clean_disconnect": session.clean_disconnect,
             "last_error": session.last_error,
+            "lenses": session.lenses,
         }
 
 
 StatusProvider = Callable[[], dict[str, object]]
-BridgeProvider = Callable[[], CameraBridge | None]
+BridgeProvider = Callable[[], dict[str, CameraBridge]]
+CAMERA_PREFIX = "/api/cameras/"
+
+
+def camera_id_from_path(path: str) -> str | None:
+    """Return the camera identifier from an /api/cameras/<id>/... request path."""
+
+    if not path.startswith(CAMERA_PREFIX):
+        return None
+    segment = path[len(CAMERA_PREFIX):].split("/", 1)[0]
+    if not segment:
+        return None
+    return unquote(segment)
+
+
+def lens_from_query(query: str) -> int | None:
+    """The requested lens index; absent means lens 0, malformed means None."""
+
+    values = parse_qs(query).get("lens")
+    if not values:
+        return 0
+    value = values[0]
+    return int(value) if value.isdigit() and len(value) == 1 else None
 
 
 def make_handler(
@@ -156,11 +189,33 @@ def make_handler(
                 self._json(200 if ready else 503, payload)
                 return
 
-            bridge = bridge_provider()
-            if bridge is None:
+            bridges = self._bridges()
+            if not bridges:
                 self._json(503, {"error": "bridge_not_ready"})
                 return
+            if parsed.path == "/api/devices":
+                if not self._authenticated_any(bridges):
+                    self._json(401, {"error": "unauthorized"})
+                    return
+                self._json(
+                    200,
+                    [
+                        {
+                            "camera_id": bridge.camera_id,
+                            "name": bridge.camera_name,
+                            "lenses": bridge.session.lenses,
+                        }
+                        for bridge in bridges.values()
+                    ],
+                )
+                return
+            camera_id = camera_id_from_path(parsed.path)
+            bridge = bridges.get(camera_id) if camera_id else None
+            if bridge is None:
+                self._json(404, {"error": "not_found"})
+                return
             camera_prefix = f"/api/cameras/{quote(bridge.camera_id, safe='')}"
+            lens = lens_from_query(parsed.query)
             if parsed.path in (
                 f"{camera_prefix}/stream.h264",
                 f"{camera_prefix}/stream.ts",
@@ -169,25 +224,27 @@ def make_handler(
                 if not bridge.stream_authenticated(token):
                     self._json(401, {"error": "unauthorized"})
                     return
-                if parsed.path.endswith("/stream.ts"):
-                    self._muxed_stream(bridge)
+                if lens is None:
+                    self._json(400, {"error": "invalid_lens"})
+                elif parsed.path.endswith("/stream.ts"):
+                    self._muxed_stream(bridge, lens)
                 else:
-                    self._raw_stream(bridge)
+                    self._raw_stream(bridge, lens)
                 return
             if not bridge.authenticated(self.headers.get("Authorization")):
                 self._json(401, {"error": "unauthorized"})
                 return
-            if parsed.path == "/api/devices":
+            if parsed.path == f"{camera_prefix}/status":
+                self._json(200, bridge.status())
+            elif lens is None:
+                self._json(400, {"error": "invalid_lens"})
+            elif parsed.path == f"{camera_prefix}/snapshot.jpg":
+                self._snapshot(bridge, lens)
+            elif parsed.path == f"{camera_prefix}/stream/source":
                 self._json(
                     200,
-                    [{"camera_id": bridge.camera_id, "name": bridge.camera_name}],
+                    {"stream_url": bridge.stream_url(self.headers.get("Host"), lens)},
                 )
-            elif parsed.path == f"{camera_prefix}/status":
-                self._json(200, bridge.status())
-            elif parsed.path == f"{camera_prefix}/snapshot.jpg":
-                self._snapshot(bridge)
-            elif parsed.path == f"{camera_prefix}/stream/source":
-                self._json(200, {"stream_url": bridge.stream_url(self.headers.get("Host"))})
             else:
                 self._json(404, {"error": "not_found"})
 
@@ -226,19 +283,34 @@ def make_handler(
             else:
                 self._json(404, {"error": "not_found"})
 
+        def _bridges(self) -> dict[str, CameraBridge]:
+            return bridge_provider() or {}
+
+        def _authenticated_any(self, bridges: dict[str, CameraBridge]) -> bool:
+            authorization = self.headers.get("Authorization")
+            return any(
+                bridge.authenticated(authorization) for bridge in bridges.values()
+            )
+
         def _authorized_bridge(self) -> CameraBridge | None:
-            bridge = bridge_provider()
-            if bridge is None:
+            # Changes (PATCH/POST) require the main token, never a guest token.
+            bridges = self._bridges()
+            if not bridges:
                 self._json(503, {"error": "bridge_not_ready"})
                 return None
-            if not bridge.authenticated(self.headers.get("Authorization")):
+            camera_id = camera_id_from_path(urlsplit(self.path).path)
+            bridge = bridges.get(camera_id) if camera_id else None
+            if bridge is None:
+                self._json(404, {"error": "not_found"})
+                return None
+            if not bridge.authenticated(self.headers.get("Authorization"), write=True):
                 self._json(401, {"error": "unauthorized"})
                 return None
             return bridge
 
-        def _snapshot(self, bridge: CameraBridge) -> None:
+        def _snapshot(self, bridge: CameraBridge, lens: int = 0) -> None:
             try:
-                jpeg, _width, _height = bridge.session.snapshot(bridge.ffmpeg)
+                jpeg, _width, _height = bridge.session.snapshot(bridge.ffmpeg, lens=lens)
             except P2PError:
                 self._json(503, {"error": "snapshot_unavailable"})
                 return
@@ -249,9 +321,9 @@ def make_handler(
             self.end_headers()
             self.wfile.write(jpeg)
 
-        def _raw_stream(self, bridge: CameraBridge) -> None:
+        def _raw_stream(self, bridge: CameraBridge, lens: int = 0) -> None:
             try:
-                subscription = bridge.session.acquire()
+                subscription = bridge.session.acquire(lens)
             except P2PError:
                 self._json(503, {"error": "stream_unavailable"})
                 return
@@ -270,7 +342,7 @@ def make_handler(
             finally:
                 subscription.close()
 
-        def _muxed_stream(self, bridge: CameraBridge) -> None:
+        def _muxed_stream(self, bridge: CameraBridge, lens: int = 0) -> None:
             """Serve the live stream as MPEG-TS.
 
             A raw Annex-B elementary stream carries no timestamps, and Home
@@ -281,7 +353,7 @@ def make_handler(
             """
 
             try:
-                subscription = bridge.session.acquire()
+                subscription = bridge.session.acquire(lens)
             except P2PError:
                 self._json(503, {"error": "stream_unavailable"})
                 return

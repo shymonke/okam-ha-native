@@ -59,10 +59,10 @@ class OkamApi:
     async def status(self, camera_id: str) -> dict[str, Any]:
         return await self._request("GET", f"/api/cameras/{camera_id}/status")
 
-    async def snapshot(self, camera_id: str) -> bytes:
+    async def snapshot(self, camera_id: str, lens: int = 0) -> bytes:
         return await self._request(
             "GET",
-            f"/api/cameras/{camera_id}/snapshot.jpg",
+            f"/api/cameras/{camera_id}/snapshot.jpg{_lens_query(lens)}",
             timeout=ClientTimeout(total=90, connect=5),
         )
 
@@ -73,6 +73,13 @@ class OkamApi:
             json={"idle_timeout_seconds": idle_timeout},
         )
 
-    async def stream_source(self, camera_id: str) -> str:
-        result = await self._request("GET", f"/api/cameras/{camera_id}/stream/source")
+    async def stream_source(self, camera_id: str, lens: int = 0) -> str:
+        result = await self._request(
+            "GET", f"/api/cameras/{camera_id}/stream/source{_lens_query(lens)}"
+        )
         return str(result["stream_url"])
+
+
+def _lens_query(lens: int) -> str:
+    # Lens 0 keeps the original URLs, so older bridges keep working.
+    return f"?lens={lens}" if lens else ""

@@ -1,10 +1,11 @@
 {
   "title": "O-KAM Native Bridge",
   "config": {
+    "flow_title": "{name}",
     "step": {
       "user": {
         "title": "Connect to O-KAM Native Bridge",
-        "description": "Use the local URL and API token configured in the O-KAM Native Bridge app.",
+        "description": "Normally Home Assistant discovers the O-KAM Native Bridge app on its own. Use this form only for a bridge running elsewhere: enter its URL and the API token shown in the app's configuration.",
         "data": {
           "bridge_url": "Bridge URL",
           "api_token": "API token",
@@ -23,6 +24,11 @@
           "snapshot_interval": "Status refresh interval (seconds)"
         }
       },
+      "hassio_confirm": {
+        "title": "Add O-KAM camera",
+        "description": "The O-KAM Native Bridge app is running. Choose the camera to add.",
+        "data": {"camera_id": "Camera"}
+      },
       "reauth_confirm": {
         "title": "Update API token",
         "data": {"api_token": "API token"}
@@ -33,6 +39,10 @@
       "invalid_auth": "The API token is incorrect",
       "camera_not_found": "The configured camera ID was not found"
     },
-    "abort": {"already_configured": "This bridge is already configured"}
+    "abort": {
+      "already_configured": "Every camera on this bridge is already added",
+      "cannot_connect": "Cannot connect to the native bridge",
+      "invalid_auth": "The API token is incorrect"
+    }
   }
 }

@@ -6,7 +6,7 @@ import asyncio
 
 from homeassistant.components.camera import Camera, CameraEntityFeature
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from . import OkamRuntime
@@ -23,20 +23,39 @@ async def async_setup_entry(
     entry: ConfigEntry[OkamRuntime],
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    async_add_entities([OkamCamera(entry.runtime_data)])
+    runtime = entry.runtime_data
+    added: set[int] = set()
+
+    @callback
+    def add_lenses() -> None:
+        # A multi-lens camera reports its lens count once it has streamed;
+        # each newly reported lens becomes its own camera entity.
+        count = runtime.coordinator.data.get("lenses", 1)
+        count = count if isinstance(count, int) and 1 <= count <= 4 else 1
+        new = [OkamCamera(runtime, lens) for lens in range(count) if lens not in added]
+        added.update(camera.lens for camera in new)
+        if new:
+            async_add_entities(new)
+
+    add_lenses()
+    entry.async_on_unload(runtime.coordinator.async_add_listener(add_lenses))
 
 
 class OkamCamera(OkamEntity, Camera):
     _attr_has_entity_name = False
     _attr_supported_features = CameraEntityFeature.STREAM
 
-    def __init__(self, runtime: OkamRuntime) -> None:
+    def __init__(self, runtime: OkamRuntime, lens: int = 0) -> None:
         Camera.__init__(self)
         OkamEntity.__init__(self, runtime.coordinator)
         self._api = runtime.api
-        self._attr_name = runtime.coordinator.camera_id
-        self._attr_unique_id = f"{runtime.coordinator.camera_id}_camera"
-        self.internal_integration_suggested_object_id = runtime.coordinator.camera_id
+        self.lens = lens
+        camera_id = runtime.coordinator.camera_id
+        # Lens 0 keeps the original entity, so existing setups are unchanged.
+        suffix = f"_lens_{lens + 1}" if lens else ""
+        self._attr_name = f"{camera_id} lens {lens + 1}" if lens else camera_id
+        self._attr_unique_id = f"{camera_id}_camera{suffix}"
+        self.internal_integration_suggested_object_id = f"{camera_id}{suffix}"
         self._bridge_state = str(runtime.coordinator.data.get("state", "idle"))
         self._wake_watcher: asyncio.Task[None] | None = None
         self._last_snapshot: bytes | None = None
@@ -75,6 +94,9 @@ class OkamCamera(OkamEntity, Camera):
                 continue
             state = str(status.get("state", "waking"))
             self._publish_bridge_state(state)
+            if status.get("lenses") != self.coordinator.data.get("lenses"):
+                # A newly seen lens should appear now, not at the next poll.
+                self.coordinator.async_set_updated_data(status)
             if state == "streaming":
                 return
             await asyncio.sleep(WAKE_POLL_SECONDS)
@@ -92,7 +114,7 @@ class OkamCamera(OkamEntity, Camera):
                 self.content_type = "image/png"
                 return WAKING_PLACEHOLDER
             async with self._snapshot_lock:
-                image = await self._api.snapshot(self.coordinator.camera_id)
+                image = await self._api.snapshot(self.coordinator.camera_id, self.lens)
             self._last_snapshot = image
             self.content_type = "image/jpeg"
             return image
@@ -106,4 +128,4 @@ class OkamCamera(OkamEntity, Camera):
 
     async def stream_source(self) -> str | None:
         self._ensure_wake_watcher()
-        return await self._api.stream_source(self.coordinator.camera_id)
+        return await self._api.stream_source(self.coordinator.camera_id, self.lens)

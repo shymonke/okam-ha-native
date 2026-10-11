@@ -10,14 +10,20 @@ from okam_native.p2p import (
     _stream_result,
     ConnectResult,
     P2PError,
+    VpResolution,
+    decode_vp_service_parameter,
     diagnostic_line,
     get_service_parameter,
+    is_vp_account_record,
     open_stream_process,
+    resolve_camera_client_id,
     resolve_client_id,
+    resolve_vp_device,
     run_authentication_probe,
     run_connect_probe,
     run_stream_probe,
     select_camera_password,
+    valid_vp_security,
 )
 
 
@@ -319,3 +325,236 @@ def test_diagnostic_line_renders_silent_login_candidates() -> None:
     )
 
     assert "login_attempts=-1,none" in diagnostic_line(result)
+
+
+# ---------------------------------------------------------------------------
+# VP resolution seam (offline; wire validity and streaming are UNVERIFIED)
+# ---------------------------------------------------------------------------
+
+VP_DID = "AB" + "ABCD123456ABXYZ"        # 17 chars, last 15 CS2-shaped
+VP_TRANSPORT_ID = "ABCD123456ABXYZ"      # 15 chars
+VP_ADDRESS = "ABS-" + "C" * 160          # 164 chars, <2 chars>S-<160 chars>
+VP_SECURITY = "S" * 32
+
+
+def _vp_opener(body: object = None):
+    requests = []
+
+    def opener(request, timeout: float) -> bytes:
+        requests.append(request)
+        payload = {"did": VP_DID, "address": VP_ADDRESS} if body is None else body
+        return json.dumps(payload).encode()
+
+    return opener, requests
+
+
+def test_vp_resolver_uses_the_newer_contract() -> None:
+    opener, requests = _vp_opener()
+
+    resolution = resolve_vp_device("VUID1234567A", opener=opener)
+
+    assert isinstance(resolution, VpResolution)
+    assert resolution.transport_id == VP_TRANSPORT_ID
+    assert resolution.address == VP_ADDRESS
+    assert resolution.native_identity == VP_DID
+    assert VP_DID not in repr(resolution)
+    assert VP_ADDRESS not in repr(resolution)
+    parsed = urlsplit(requests[0].full_url)
+    assert parsed.hostname == "vuid-vp.eye4.cn"
+    assert parsed.path == "/vuid/query"
+    assert parsed.query == "vuid=VUID1234567A"
+
+
+def test_vp_native_input_preserves_full_identity_and_record():
+    identity = "TEST12345678ABCDE"
+    address = "DAS-" + "C" * 160
+    opener, _ = _vp_opener({"did": identity, "address": address})
+    resolution = resolve_vp_device("VUID1234567A", opener=opener)
+    assert resolution.native_connection_input() == identity + "%%" + address
+
+
+def test_vp_native_input_does_not_guess_missing_or_legacy_identity():
+    for resolution in (VpResolution(VP_TRANSPORT_ID, VP_ADDRESS),
+                       VpResolution(VP_TRANSPORT_ID, VP_ADDRESS, VP_DID)):
+        with pytest.raises(P2PError, match="unavailable"):
+            resolution.native_connection_input()
+
+
+@pytest.mark.parametrize("body", [
+    "not-a-dict",
+    [],
+    {},
+    {"did": VP_DID},
+    {"address": VP_ADDRESS},
+    {"did": "SHORT", "address": VP_ADDRESS},
+    {"did": "AB" + "ABCD123456ABXY1", "address": VP_ADDRESS},
+    {"did": VP_DID, "address": VP_ADDRESS[:-1]},
+    {"did": VP_DID, "address": VP_ADDRESS + "C"},
+    {"did": VP_DID, "address": "ABC" + "C" * 161},
+    {"did": VP_DID, "address": "ABS-" + "Z" * 160},
+])
+def test_vp_resolver_rejects_malformed_responses(body: object) -> None:
+    opener, _requests = _vp_opener(body)
+
+    with pytest.raises(P2PError):
+        resolve_vp_device("VUID1234567A", opener=opener)
+
+
+def test_vp_resolver_failures_never_echo_inputs() -> None:
+    sentinel = "vp-sentinel.example.test"
+
+    def raising(_request, _timeout: float) -> bytes:
+        raise OSError("failure mentioning " + sentinel)
+
+    with pytest.raises(P2PError) as caught:
+        resolve_vp_device(sentinel, opener=raising)
+    message = str(caught.value)
+    assert sentinel not in message
+    assert "example.test" not in message
+
+    def malformed(_request, _timeout: float) -> bytes:
+        return b"{not json"
+
+    with pytest.raises(P2PError) as caught:
+        resolve_vp_device(sentinel, opener=malformed)
+    assert sentinel not in str(caught.value)
+
+
+def test_decode_vp_service_parameter_accepts_hostnames_and_ipv4() -> None:
+    servers, key = decode_vp_service_parameter("cam.example.com,10.0.0.1:candidate-key")
+
+    assert servers == ("cam.example.com", "10.0.0.1")
+    assert key == "candidate-key"
+
+
+def test_decode_vp_service_parameter_accepts_the_upper_bounds() -> None:
+    joined = ",".join(f"host{index}.example.com" for index in range(16))
+
+    servers, key = decode_vp_service_parameter(joined + ":" + "k" * 128)
+
+    assert len(servers) == 16
+    assert key == "k" * 128
+    assert decode_vp_service_parameter("camera:candidate-key") == (
+        ("camera",),
+        "candidate-key",
+    )
+
+
+@pytest.mark.parametrize("value", [
+    123,
+    "",
+    "no-separator",
+    ":key",
+    "server:",
+    "server:key:extra",
+    "server:bad key",
+    "server:" + "k" * 129,
+    "1.2.3:key",
+    "999.1.1.1:key",
+    "01.2.3.4:key",
+    "bad_host:key",
+    "-bad.example:key",
+    "a" * 254 + ":key",
+    ",".join(["h"] * 17) + ":key",
+    "x" * 5000 + ":key",
+])
+def test_decode_vp_service_parameter_rejects_malformed(value: object) -> None:
+    with pytest.raises(P2PError):
+        decode_vp_service_parameter(value)
+
+
+def test_decode_vp_service_parameter_failures_never_echo_inputs() -> None:
+    sentinel = "vp-sentinel.example.test"
+    with pytest.raises(P2PError) as caught:
+        decode_vp_service_parameter(sentinel)
+    assert sentinel not in str(caught.value)
+
+
+def test_valid_vp_security_enforces_the_documented_shape() -> None:
+    assert valid_vp_security("S" * 32) is True
+    for bad in (
+        "S" * 31,
+        "S" * 33,
+        "S" * 31 + " ",
+        "S" * 31 + "\n",
+        "S" * 31 + "\u00e9",
+        "",
+        None,
+        12345,
+        True,
+        ["S" * 32],
+        {"value": "S" * 32},
+    ):
+        assert valid_vp_security(bad) is False, bad
+
+
+@pytest.mark.parametrize("device_password,security,expected", [
+    ("", VP_SECURITY, True),
+    ("888888", VP_SECURITY, False),
+    (None, VP_SECURITY, False),
+    ("", None, False),
+    ("", "S" * 31, False),
+    ("", "S" * 33, False),
+    ("", "S" * 31 + "\n", False),
+    ("", "S" * 31 + " ", False),
+])
+def test_is_vp_account_record_matches_only_the_documented_shape(
+    device_password: object, security: object, expected: bool
+) -> None:
+    assert is_vp_account_record(
+        device_password=device_password, security=security
+    ) is expected
+
+
+def test_vp_router_selects_vp_for_documented_records_only() -> None:
+    vp_hosts: list[str | None] = []
+
+    def vp_opener(request, timeout: float) -> bytes:
+        vp_hosts.append(urlsplit(request.full_url).hostname)
+        return json.dumps({"did": VP_DID, "address": VP_ADDRESS}).encode()
+
+    routed = resolve_camera_client_id(
+        "VUID1234567A",
+        device_password="",
+        security=VP_SECURITY,
+        opener=vp_opener,
+    )
+    assert routed == VP_TRANSPORT_ID
+    assert vp_hosts == ["vuid-vp.eye4.cn"]
+
+    legacy_hosts: list[str | None] = []
+
+    def legacy_opener(request, timeout: float) -> bytes:
+        legacy_hosts.append(urlsplit(request.full_url).hostname)
+        return json.dumps({"uid": "ABCD123456789"}).encode()
+
+    routed = resolve_camera_client_id(
+        "VUID1234567A",
+        device_password="888888",
+        security=VP_SECURITY,
+        opener=legacy_opener,
+    )
+    assert routed == "ABCD123456789"
+    assert legacy_hosts == ["vuid.eye4.cn"]
+
+
+def test_non_vp_resolution_is_unchanged_and_never_calls_the_vp_endpoint() -> None:
+    def never(_request, _timeout: float) -> bytes:
+        raise AssertionError("the resolver should not be called")
+
+    # A physical identifier still short-circuits without any request.
+    assert resolve_camera_client_id(
+        "ABCD123456789",
+        device_password="",
+        security=None,
+        opener=never,
+    ) == "ABCD123456789"
+
+    hosts: list[str | None] = []
+
+    def legacy_opener(request, timeout: float) -> bytes:
+        hosts.append(urlsplit(request.full_url).hostname)
+        return json.dumps({"uid": "ABCD123456789"}).encode()
+
+    assert resolve_client_id("VUID1234567A", opener=legacy_opener) == "ABCD123456789"
+    assert hosts == ["vuid.eye4.cn"]
